@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
   <meta name="theme-color" content="#FFF8E7"/>
-  <title>Story Time 📖</title>
+  <title>Minden napra egy mese 📖</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
@@ -149,7 +149,7 @@ NO text anywhere in the SVG. Reply with ONLY the complete SVG starting with <svg
 
 /* ── Constants ── */
 const PIN_DEFAULT = "1234";
-const SEG_MAX = 10;
+const SEG_MAX = 30;
 const NAR = {
   dad: { color: "#3B82F6", glow: "#93C5FD", label: "Dad", icon: "👨" },
   mum: { color: "#EC4899", glow: "#F9A8D4", label: "Mum", icon: "👩" },
@@ -794,7 +794,7 @@ function App() {
               {totalDur > 0 && <div style={{ fontSize:"0.72rem", color:"#94A3B8", fontWeight:700, background:"#F8FAFC", borderRadius:20, padding:"3px 9px" }}>{fmt(totalDur)} · {edSegs.length} seg{edSegs.length!==1?"s":""}</div>}
             </div>
             <div style={{ fontSize:"0.76rem", color:"#94A3B8", marginBottom:14, lineHeight:1.5 }}>
-              Record in <strong style={{color:"#64748B"}}>10-second segments</strong>. Mess up a segment? Delete and re-record just that one.
+              Record in <strong style={{color:"#64748B"}}>30-second segments</strong>. Mess up a segment? Delete and re-record just that one.
             </div>
 
             {edSegs.length > 0 && (
