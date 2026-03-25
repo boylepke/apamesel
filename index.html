@@ -312,15 +312,18 @@ function App() {
 
   // Crossfade: old image fades out while new one fades in simultaneously
   const fadeInSVG = (svg) => {
-    setIllusPrev(illusRef.current); // move current → background layer
-    setIllusPrevOp(1);              // background starts fully visible
-    setIllus(svg);                  // new image on top, starts transparent
+    setIllusPrev(illusRef.current);
+    setIllusPrevOp(1);
+    setIllus(svg);
     setIllusOp(0);
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      setIllusOp(1);                // new image fades in
-      setIllusPrevOp(0);            // old image fades out
+      setIllusOp(1);
+      setIllusPrevOp(0);
     }));
   };
+  // Ref so the memoized checkScene always calls the latest fadeInSVG
+  const fadeInSVGRef = useRef(fadeInSVG);
+  useEffect(() => { fadeInSVGRef.current = fadeInSVG; });
 
   const checkScene = useCallback(async (time) => {
     const story = pStoryRef.current;
@@ -336,10 +339,10 @@ function App() {
     // Check for uploaded image (stored separately, keyed by original scene index)
     const uploadedImg = sceneImgsRef.current[sorted[ai].imgIdx ?? ai];
     if (uploadedImg) {
-      fadeInSVG(`<img src="${uploadedImg}" style="width:100%;height:100%;object-fit:cover;display:block;"/>`);
+      fadeInSVGRef.current(`<img src="${uploadedImg}" style="width:100%;height:100%;object-fit:cover;display:block;"/>`);
       return;
     }
-    if (svgCacheRef.current[key]) { fadeInSVG(svgCacheRef.current[key]); return; }
+    if (svgCacheRef.current[key]) { fadeInSVGRef.current(svgCacheRef.current[key]); return; }
     if (genRef.current) return;
     genRef.current = true; setGenIllus(true); setIllusError(null);
     try {
@@ -351,7 +354,7 @@ function App() {
         // Store in cache regardless of current scene position
         svgCacheRef.current = { ...svgCacheRef.current, [key]: result.svg };
         try { await storage.set("svg-cache", JSON.stringify(svgCacheRef.current)); } catch {}
-        fadeInSVG(result.svg);
+        fadeInSVGRef.current(result.svg);
       }
     } catch (e) { lastScRef.current = -1; setIllusError(`Unexpected error: ${e.message}`); }
     genRef.current = false; setGenIllus(false);
@@ -604,7 +607,7 @@ function App() {
       ))}
       <div style={{ textAlign:"center", padding:"40px 20px 24px", position:"relative", zIndex:1 }}>
         <div className="float" style={{ fontSize:54, lineHeight:1, marginBottom:4 }}>📖</div>
-        <h1 style={{ fontFamily:"'Fredoka One',cursive", fontSize:"clamp(2rem,6vw,3.2rem)", color:"#78350F", margin:"6px 0 14px", textShadow:"0 2px 0 rgba(255,255,255,.6)" }}>Story Time!</h1>
+        <h1 style={{ fontFamily:"'Fredoka One',cursive", fontSize:"clamp(2rem,6vw,3.2rem)", color:"#78350F", margin:"6px 0 14px", textShadow:"0 2px 0 rgba(255,255,255,.6)" }}>Minden napra egy mese</h1>
         <div style={{ display:"flex", justifyContent:"center", gap:20 }}>
           {Object.entries(NAR).map(([k,v]) => (
             <div key={k} style={{ display:"flex", alignItems:"center", gap:6, fontSize:"0.8rem", fontWeight:800, color:"#92400E" }}>
