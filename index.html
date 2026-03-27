@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="theme-color" content="#FFF8E7"/>
+  <title>Storyo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700;800&family=Fredoka+One&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    body {
+      font-family: 'Baloo 2', sans-serif;
+      background: linear-gradient(170deg, #FFF0F8 0%, #FFF8E7 45%, #FFE5A0 100%);
+      display: flex; align-items: center; justify-content: center;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Animated background ── */
+    .bg { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+
+    @keyframes cloudDrift1 { 0%{transform:translateX(0)} 100%{transform:translateX(18px)} }
+    @keyframes cloudDrift2 { 0%{transform:translateX(0)} 100%{transform:translateX(-14px)} }
+    @keyframes cloudDrift3 { 0%{transform:translateX(0)} 100%{transform:translateX(22px)} }
+    @keyframes unicornBob  { 0%,100%{transform:translateY(0) rotate(-2deg)} 50%{transform:translateY(-10px) rotate(2deg)} }
+    @keyframes rainbowPulse{ 0%,100%{opacity:.13} 50%{opacity:.22} }
+    @keyframes floatBook   { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+    @keyframes fadeUp      { from{opacity:0;transform:translateY(22px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes popIn       { from{opacity:0;transform:scale(.85)} to{opacity:1;transform:scale(1)} }
+    @keyframes shimmer     { 0%{background-position:200% center} 100%{background-position:-200% center} }
+
+    .cloud1 { animation: cloudDrift1 7s ease-in-out infinite alternate; }
+    .cloud2 { animation: cloudDrift2 9s ease-in-out infinite alternate; }
+    .cloud3 { animation: cloudDrift3 6s ease-in-out infinite alternate; }
+    .unicorn-bg { animation: unicornBob 5s ease-in-out infinite; }
+    .rainbow-bg { animation: rainbowPulse 6s ease-in-out infinite; }
+
+    /* ── Card ── */
+    .card {
+      position: relative; z-index: 1;
+      text-align: center;
+      animation: fadeUp .5s cubic-bezier(.34,1.56,.64,1) both;
+      padding: 0 24px;
+      max-width: 560px;
+      width: 100%;
+    }
+
+    .book-icon {
+      font-size: 72px; line-height: 1; display: block; margin-bottom: 16px;
+      animation: floatBook 3.2s ease-in-out infinite;
+      filter: drop-shadow(0 8px 20px rgba(180,100,40,.2));
+    }
+
+    h1 {
+      font-family: 'Fredoka One', cursive;
+      font-size: clamp(1.5rem, 5vw, 2.2rem);
+      color: #78350F;
+      margin-bottom: 6px;
+      text-shadow: 0 2px 0 rgba(255,255,255,.6);
+      letter-spacing: .01em;
+    }
+
+    .subtitle {
+      font-size: .82rem; color: #A16207; font-weight: 600;
+      margin-bottom: 36px; opacity: .8;
+    }
+
+    /* ── Language buttons ── */
+    .langs {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+    @media (max-width: 400px) {
+      .langs { grid-template-columns: repeat(3, 1fr); }
+    }
+
+    .lang-btn {
+      background: white;
+      border: none; border-radius: 20px;
+      padding: 16px 10px 13px;
+      cursor: pointer;
+      box-shadow: 0 2px 0 rgba(180,120,40,.18), 0 8px 28px rgba(0,0,0,.10),
+                  inset 0 1px 0 rgba(255,255,255,.9);
+      transition: transform .18s cubic-bezier(.34,1.56,.64,1), box-shadow .18s;
+      animation: popIn .4s cubic-bezier(.34,1.56,.64,1) both;
+      position: relative; overflow: hidden;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .lang-btn:nth-child(1) { animation-delay: 0.06s; }
+    .lang-btn:nth-child(2) { animation-delay: 0.12s; }
+    .lang-btn:nth-child(3) { animation-delay: 0.18s; }
+    .lang-btn:nth-child(4) { animation-delay: 0.24s; }
+    .lang-btn:nth-child(5) { animation-delay: 0.3s; }
+    .lang-btn:nth-child(6) { animation-delay: 0.36s; }
+    .lang-btn:nth-child(7) { animation-delay: 0.42s; }
+    .lang-btn:nth-child(8) { animation-delay: 0.48s; }
+    .lang-btn:nth-child(9) { animation-delay: 0.54s; }
+    .lang-btn:nth-child(10) { animation-delay: 0.6s; }
+    .lang-btn:nth-child(11) { animation-delay: 0.66s; }
+    .lang-btn:nth-child(12) { animation-delay: 0.72s; }
+
+    .lang-btn::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0; height: 4px;
+      border-radius: 24px 24px 0 0;
+    }
+    .lang-btn.hu::before { background: linear-gradient(90deg, #CE2939, #FFFFFF, #436F4D); }
+    .lang-btn.en::before { background: linear-gradient(90deg, #012169, #C8102E, #FFFFFF); }
+    .lang-btn.de::before { background: linear-gradient(90deg, #000000, #DD0000, #FFCE00); }
+    .lang-btn.fr::before { background: linear-gradient(90deg, #002395, #FFFFFF, #ED2939); }
+    .lang-btn.it::before { background: linear-gradient(90deg, #009246, #FFFFFF, #CE2B37); }
+    .lang-btn.es::before { background: linear-gradient(90deg, #AA151B, #F1BF00, #AA151B); }
+    .lang-btn.nl::before { background: linear-gradient(90deg, #AE1C28, #FFFFFF, #21468B); }
+    .lang-btn.fi::before { background: linear-gradient(90deg, #FFFFFF, #003580, #FFFFFF); }
+    .lang-btn.no::before { background: linear-gradient(90deg, #EF2B2D, #FFFFFF, #002868); }
+    .lang-btn.sv::before { background: linear-gradient(90deg, #006AA7, #FECC02, #006AA7); }
+    .lang-btn.uk::before { background: linear-gradient(90deg, #005BBB, #FFD500); }
+    .lang-btn.zh::before { background: linear-gradient(90deg, #DE2910, #FFDE00, #DE2910); }
+
+    .lang-btn:active { transform: scale(.94); }
+    .lang-btn:hover  { transform: translateY(-5px) scale(1.03);
+      box-shadow: 0 2px 0 rgba(180,120,40,.18), 0 16px 36px rgba(0,0,0,.14),
+                  inset 0 1px 0 rgba(255,255,255,.9); }
+
+    .flag  { font-size: 30px; line-height: 1; margin-bottom: 7px; display: block; }
+    .lang-name {
+      font-family: 'Fredoka One', cursive;
+      font-size: .95rem; color: #1E293B; display: block; margin-bottom: 2px;
+    }
+    .lang-sub {
+      font-size: .62rem; color: #94A3B8; font-weight: 600;
+    }
+
+    /* ── Remember pill ── */
+    .remember {
+      display: inline-flex; align-items: center; gap: 7px;
+      font-size: .72rem; color: #A16207; font-weight: 600;
+      background: rgba(255,255,255,.6); border-radius: 20px;
+      padding: 6px 14px; cursor: pointer;
+      border: 1px solid rgba(217,119,6,.2);
+      backdrop-filter: blur(4px);
+      transition: background .15s;
+      animation: fadeUp .5s .35s cubic-bezier(.34,1.56,.64,1) both;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .remember:hover { background: rgba(255,255,255,.85); }
+    .remember input { accent-color: #D97706; width: 14px; height: 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+
+<!-- Background SVG (same as the app's szivarvany theme) -->
+<div class="bg">
+  <svg viewBox="0 0 800 520" xmlns="http://www.w3.org/2000/svg"
+    style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none">
+    <defs>
+      <linearGradient id="rb" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%"   stop-color="#FF6B6B" stop-opacity="0.22"/>
+        <stop offset="16%"  stop-color="#FF9F43" stop-opacity="0.22"/>
+        <stop offset="33%"  stop-color="#FECA57" stop-opacity="0.22"/>
+        <stop offset="50%"  stop-color="#48DBFB" stop-opacity="0.22"/>
+        <stop offset="66%"  stop-color="#1DD1A1" stop-opacity="0.22"/>
+        <stop offset="83%"  stop-color="#5F27CD" stop-opacity="0.22"/>
+        <stop offset="100%" stop-color="#FF6B9D" stop-opacity="0.22"/>
+      </linearGradient>
+      <linearGradient id="rb2" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%"   stop-color="#FF6B6B" stop-opacity="0.14"/>
+        <stop offset="50%"  stop-color="#48DBFB" stop-opacity="0.14"/>
+        <stop offset="100%" stop-color="#FF6B9D" stop-opacity="0.14"/>
+      </linearGradient>
+    </defs>
+    <g class="rainbow-bg">
+      <path d="M-40,320 Q200,20 440,320"  fill="none" stroke="url(#rb)"  stroke-width="38" stroke-linecap="round"/>
+      <path d="M-40,348 Q200,48 440,348"  fill="none" stroke="url(#rb2)" stroke-width="22" stroke-linecap="round"/>
+    </g>
+    <g class="rainbow-bg" style="animation-delay:3s">
+      <path d="M420,480 Q640,180 860,480" fill="none" stroke="url(#rb)"  stroke-width="30" stroke-linecap="round"/>
+      <path d="M420,506 Q640,206 860,506" fill="none" stroke="url(#rb2)" stroke-width="16" stroke-linecap="round"/>
+    </g>
+    <!-- Clouds -->
+    <g class="cloud1" style="opacity:.5">
+      <ellipse cx="680" cy="72"  rx="68" ry="28" fill="white"/>
+      <ellipse cx="648" cy="80"  rx="42" ry="22" fill="white"/>
+      <ellipse cx="718" cy="78"  rx="38" ry="20" fill="white"/>
+    </g>
+    <g class="cloud2" style="opacity:.45">
+      <ellipse cx="120" cy="110" rx="56" ry="22" fill="white"/>
+      <ellipse cx="94"  cy="118" rx="36" ry="18" fill="white"/>
+      <ellipse cx="152" cy="116" rx="32" ry="17" fill="white"/>
+    </g>
+    <g class="cloud3" style="opacity:.4">
+      <ellipse cx="400" cy="48"  rx="50" ry="20" fill="white"/>
+      <ellipse cx="374" cy="56"  rx="32" ry="16" fill="white"/>
+      <ellipse cx="432" cy="54"  rx="28" ry="15" fill="white"/>
+    </g>
+    <!-- Unicorn -->
+    <g class="unicorn-bg" style="opacity:.16">
+      <ellipse cx="590" cy="410" rx="90" ry="55" fill="#F9A8D4"/>
+      <ellipse cx="620" cy="362" rx="28" ry="38" fill="#F9A8D4" transform="rotate(-18 620 362)"/>
+      <ellipse cx="646" cy="330" rx="30" ry="24" fill="#FBCFE8"/>
+      <polygon points="658,310 663,274 668,310" fill="#FCD34D"/>
+      <ellipse cx="655" cy="328" rx="5" ry="5" fill="#7C3AED"/>
+      <ellipse cx="657" cy="326" rx="2" ry="2" fill="white"/>
+      <path d="M626,318 Q612,340 618,368 Q608,352 600,374" fill="none" stroke="#C084FC" stroke-width="7" stroke-linecap="round"/>
+      <rect x="548" y="452" width="18" height="52" rx="9" fill="#FBCFE8"/>
+      <rect x="574" y="456" width="18" height="50" rx="9" fill="#FBCFE8"/>
+      <rect x="612" y="456" width="18" height="50" rx="9" fill="#FBCFE8"/>
+      <rect x="638" y="452" width="18" height="52" rx="9" fill="#FBCFE8"/>
+    </g>
+  </svg>
+</div>
+
+<!-- Selector card -->
+<div class="card">
+  <p class="subtitle">Válassz nyelvet · Choose a language</p>
+
+  <div class="langs">
+    <button class="lang-btn hu" onclick="pick('hu')">
+      <span class="flag">🇭🇺</span>
+      <span class="lang-name">Magyar</span>
+    </button>
+    <button class="lang-btn en" onclick="pick('en')">
+      <span class="flag">🇬🇧</span>
+      <span class="lang-name">English</span>
+    </button>
+    <button class="lang-btn de" onclick="pick('de')">
+      <span class="flag">🇩🇪</span>
+      <span class="lang-name">Deutsch</span>
+    </button>
+    <button class="lang-btn fr" onclick="pick('fr')">
+      <span class="flag">🇫🇷</span>
+      <span class="lang-name">Français</span>
+    </button>
+    <button class="lang-btn it" onclick="pick('it')">
+      <span class="flag">🇮🇹</span>
+      <span class="lang-name">Italiano</span>
+    </button>
+    <button class="lang-btn es" onclick="pick('es')">
+      <span class="flag">🇪🇸</span>
+      <span class="lang-name">Español</span>
+    </button>
+    <button class="lang-btn nl" onclick="pick('nl')">
+      <span class="flag">🇳🇱</span>
+      <span class="lang-name">Nederlands</span>
+    </button>
+    <button class="lang-btn fi" onclick="pick('fi')">
+      <span class="flag">🇫🇮</span>
+      <span class="lang-name">Suomi</span>
+    </button>
+    <button class="lang-btn no" onclick="pick('no')">
+      <span class="flag">🇳🇴</span>
+      <span class="lang-name">Norsk</span>
+    </button>
+    <button class="lang-btn sv" onclick="pick('sv')">
+      <span class="flag">🇸🇪</span>
+      <span class="lang-name">Svenska</span>
+    </button>
+    <button class="lang-btn uk" onclick="pick('uk')">
+      <span class="flag">🇺🇦</span>
+      <span class="lang-name">Українська</span>
+    </button>
+    <button class="lang-btn zh" onclick="pick('zh')">
+      <span class="flag">🇨🇳</span>
+      <span class="lang-name">中文</span>
+    </button>
+  </div>
+
+  <label class="remember">
+    <input type="checkbox" id="rememberMe" checked/>
+    Megjegyez · Remember my choice
+  </label>
+</div>
+
+<script>
+  // If user already chose and checked "remember", go straight there
+  const saved = localStorage.getItem('storytime-lang');
+  if (saved) {
+    window.location.replace('index_' + saved + '.html');
+  }
+
+  function pick(lang) {
+    if (document.getElementById('rememberMe').checked) {
+      localStorage.setItem('storytime-lang', lang);
+    }
+    window.location.href = 'index_' + lang + '.html';
+  }
+</script>
+</body>
+</html>
