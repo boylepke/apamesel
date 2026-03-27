@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="theme-color" content="#FFF8E7"/>
+  <title>每天一个故事 📖</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;500;600;700;800&family=Fredoka+One&display=swap" rel="stylesheet"/>
+  <style>
+    html, body, #root { height: 100%; margin: 0; padding: 0; }
+    body { overflow-x: hidden; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ── IndexedDB storage (no 5 MB quota — handles large audio & images) ── */
+const storage = (() => {
+  const DB_NAME = "storytime-db";
+  const STORE   = "kv";
+  let _db = null;
+
+  const getDB = () => new Promise((resolve, reject) => {
+    if (_db) { resolve(_db); return; }
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(STORE);
+    req.onsuccess = e => { _db = e.target.result; resolve(_db); };
+    req.onerror   = e => reject(e.target.error);
+  });
+
+  const tx = async (mode, fn) => {
+    const db    = await getDB();
+    const store = db.transaction(STORE, mode).objectStore(STORE);
+    return new Promise((resolve, reject) => {
+      const req = fn(store);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    });
+  };
+
+  return {
+    get:    async (key)        => { const v = await tx("readonly",  s => s.get(key));      return v !== undefined ? { value: v } : null; },
+    set:    async (key, value) => { await tx("readwrite", s => s.put(String(value), key)); return { value }; },
+    delete: async (key)        => { await tx("readwrite", s => s.delete(key));             return { deleted: true }; },
+  };
+})();
+
+/* ── Audio utilities ── */
+function b64ToAB(b64) {
+  const bin = atob(b64.split(",")[1]);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8.buffer;
+}
+
+function bufToWavUrl(buf) {
+  const nc = buf.numberOfChannels, sr = buf.sampleRate, n = buf.length;
+  const ds = n * nc * 2, ab = new ArrayBuffer(44 + ds), v = new DataView(ab);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0,"RIFF"); v.setUint32(4,36+ds,true); ws(8,"WAVE"); ws(12,"fmt ");
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,nc,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*nc*2,true);
+  v.setUint16(32,nc*2,true); v.setUint16(34,16,true);
+  ws(36,"data"); v.setUint32(40,ds,true);
+  let o = 44;
+  for (let i = 0; i < n; i++) for (let c = 0; c < nc; c++) {
+    const s = Math.max(-1, Math.min(1, buf.getChannelData(c)[i]));
+    v.setInt16(o, s < 0 ? s * 32768 : s * 32767, true); o += 2;
+  }
+  return URL.createObjectURL(new Blob([ab], { type: "audio/wav" }));
+}
+
+async function concatToUrl(b64s) {
+  if (!b64s?.length) return null;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AC();
+  const bufs = (await Promise.all(
+    b64s.map(b => ctx.decodeAudioData(b64ToAB(b)).catch(() => null))
+  )).filter(Boolean);
+  if (!bufs.length) { ctx.close(); return null; }
+  const nc = bufs[0].numberOfChannels, sr = bufs[0].sampleRate;
+  const total = bufs.reduce((a, b) => a + b.length, 0);
+  const out = ctx.createBuffer(nc, total, sr);
+  let off = 0;
+  for (const b of bufs) {
+    for (let c = 0; c < nc; c++) out.getChannelData(c).set(b.getChannelData(c), off);
+    off += b.length;
+  }
+  ctx.close();
+  return bufToWavUrl(out);
+}
+
+const getDur = b64 => new Promise(res => {
+  const a = new Audio(); a.src = b64;
+  a.onloadedmetadata = () => res(a.duration || 0);
+  a.onerror = () => res(0);
+});
+
+// Returns { svg } on success or { error } on failure
+// Shared illustration prompt (used by both providers)
+const ILLUS_PROMPT = (title, desc) =>
+  `Children's book illustration, dreamy painterly style inspired by Mary Blair and Beatrix Potter. ` +
+  `Scene from the story "${title}": ${desc}. ` +
+  `Soft watercolor textures, warm pastel palette with magical glows, charming rounded characters with large expressive eyes, ` +
+  `rich layered background with atmospheric depth, detailed whimsical environment. No text in the image.`;
+
+async function genSVG(desc, title, apiKey, provider) {
+  if (!apiKey) return { error: "没有 API 密钥 — 请在管理面板中设置" };
+  try {
+    if (provider === "openai" || provider === "gpt-image-1") {
+      // DALL-E 3 or gpt-image-1 — both use /v1/images/generations
+      const model = provider === "gpt-image-1" ? "gpt-image-1" : "dall-e-3";
+      const body = provider === "gpt-image-1"
+        ? { model, prompt: ILLUS_PROMPT(title, desc), n: 1, size: "1024x1024",
+            quality: "high", output_format: "webp" }
+        : { model, prompt: ILLUS_PROMPT(title, desc), n: 1, size: "1024x1024",
+            response_format: "b64_json" };
+      const r = await fetch("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify(body)
+      });
+      const d = await r.json();
+      if (d.error) return { error: `API: ${d.error.code} — ${d.error.message}` };
+      if (!r.ok)   return { error: `HTTP ${r.status}: ${d.error?.message || r.statusText}` };
+      const b64 = d.data?.[0]?.b64_json ?? d.data?.[0]?.image;
+      if (!b64) return { error: "OpenAI 未发送图片" };
+      const mime = provider === "gpt-image-1" ? "image/webp" : "image/png";
+      return { svg: `<img src="data:${mime};base64,${b64}" style="width:100%;height:100%;object-fit:cover;display:block;"/>` };
+    } else {
+      // Claude: SVG illustration
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514", max_tokens: 4000,
+          messages: [{ role: "user", content: `You are a master children's book illustrator in the tradition of Mary Blair and Beatrix Potter. Create a RICH, DETAILED SVG illustration (viewBox="0 0 600 400") for this scene from "${title}": "${desc}".
+
+Technical requirements:
+- Use <defs> with linearGradient and radialGradient elements for sky, ground, lighting
+- Layer 6-10 distinct depth planes: distant sky → far background → mid background → midground → foreground → foreground details
+- Characters must have: rounded body shapes, large expressive eyes with highlights (white dot), blush marks, distinctive silhouettes
+- Environment: detailed ground texture, layered foliage or landscape, atmospheric perspective (lighter/hazier in distance)
+- Lighting: define a clear light source with cast shadows (darker ellipses under objects), rim lighting on characters
+- Magic/atmosphere: add 8-15 small glowing particles or sparkles using <circle> with radialGradient, subtle light rays using semi-transparent polygons
+- Color: rich saturated palette with complementary accent colors, avoid flat fills — use gradients on every major shape
+- Detail: add texture to surfaces (cross-hatched shadows, stippled ground, leaf clusters), small environmental storytelling props
+- Composition: subject in rule-of-thirds position, leading lines drawing eye to focal point
+
+NO text anywhere in the SVG. Reply with ONLY the complete SVG starting with <svg and ending with </svg>.` }]
+        })
+      });
+      const d = await r.json();
+      if (d.error) return { error: `API: ${d.error.type} — ${d.error.message}` };
+      if (!r.ok)   return { error: `HTTP ${r.status}: ${d.error?.message || r.statusText}` };
+      const text = d.content?.find(b => b.type === "text")?.text || "";
+      const m = text.match(/<svg[\s\S]*<\/svg>/i);
+      if (!m) return { error: "模型已响应但未返回 SVG" };
+      return { svg: m[0] };
+    }
+  } catch (e) {
+    return { error: `网络错误：${e.message}` };
+  }
+}
+
+/* ── Constants ── */
+const PIN_DEFAULT = "1234";
+const SEG_MAX = 30;
+const NAR = {
+  dad: { color: "#3B82F6", glow: "#93C5FD", label: "爸爸", icon: "👨" },
+  mum: { color: "#EC4899", glow: "#F9A8D4", label: "妈妈", icon: "👩" },
+};
+const PALETTES = [
+  { bg: "#FFFBEB", accent: "#D97706" }, { bg: "#EFF6FF", accent: "#2563EB" },
+  { bg: "#F0FDF4", accent: "#16A34A" }, { bg: "#FDF4FF", accent: "#9333EA" },
+  { bg: "#FFF1F2", accent: "#E11D48" }, { bg: "#F0FDFA", accent: "#0D9488" },
+  { bg: "#FEFCE8", accent: "#CA8A04" }, { bg: "#F8FAFC", accent: "#475569" },
+];
+const EMOJIS = ["🐉","🧚","🦄","🐺","🧙","🏰","🌙","⭐","🦊","🐸","🌈","🧸","🐬","🦁","🍄","🌺","🐠","🦋","🐣","🧜","🐻","🦅","🌟","🎠","🧝","🪄","🐝","🏔️","🌊","🎪","🐘","🦒","🦓","🐆","🐅","🦏","🦛","🐪","🦘","🦙","🐒","🦍","🦮","🐕","🐈","🐇","🐿️","🦔","🦦","🦥","🦝","🦨","🐓","🦚","🦜","🦩","🦢","🦆","🐧","🦉","🦇","🐺","🐗","🐴","🦌","🐑","🐐","🦬","🐋","🦈","🐙","🦑","🦐","🦞","🐡","🐊","🐢","🦎","🐍","🐸","🦋","🐞","🪲","🐜","🦗","🕷️","🦂","🐛","🪱"];
+const WALLPAPERS = [
+  { id:'rozsa',      label:'\u{1F338} 女孩',    grad:'linear-gradient(160deg,#FFDDE1 0%,#FFB3C6 40%,#FF8FAB 100%)', dark:false, titleCol:'#7B1458', subCol:'#9D174D' },
+  { id:'kek',        label:'\u{1F680} 男孩',      grad:'linear-gradient(160deg,#0F172A 0%,#1E3A5F 50%,#0C4A6E 100%)', dark:true,  titleCol:'#E0F2FE', subCol:'#BAE6FD' },
+  { id:'szivarvany', label:'\u{1F984} 独角兽', grad:'linear-gradient(170deg,#FFF0F8 0%,#FFF8E7 50%,#FFE5A0 100%)',        dark:false, titleCol:'#78350F', subCol:'#92400E' },
+  { id:'erdo',       label:'\u{1F332} 森林',      grad:'linear-gradient(160deg,#ECFDF5 0%,#D1FAE5 40%,#A7F3D0 100%)', dark:false, titleCol:'#064E3B', subCol:'#065F46' },
+  { id:'tenger',     label:'\u{1F30A} 海洋',    grad:'linear-gradient(160deg,#EFF6FF 0%,#DBEAFE 40%,#BFDBFE 100%)',        dark:false, titleCol:'#1E3A5F', subCol:'#1E40AF' },
+  { id:'ejszaka',    label:'\u{1F319} 夜晚',   grad:'linear-gradient(160deg,#1E1B4B 0%,#312E81 50%,#1E1B4B 100%)', dark:true,  titleCol:'#E0E7FF', subCol:'#C7D2FE' },
+];
+const fmt = s => (!s || isNaN(s)) ? "0:00" : `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,"0")}`;
+const parseSec = str => { const s=(str||"").trim(); if(s.includes(":")) { const [m,ss]=s.split(":").map(Number); return m*60+(ss||0); } return parseFloat(s)||0; };
+
+/* Stable sub-components — must live outside App so they don't get recreated on every render,
+   which would cause React to remount them and dismiss the Android keyboard on each keystroke. */
+const LBL = ({ children }) => (
+  <span style={{ display:"block", color:"#92400E", fontSize:"0.68rem", fontWeight:800, letterSpacing:"0.09em", marginBottom:8, textTransform:"uppercase" }}>{children}</span>
+);
+const CARD = ({ children, style: s }) => (
+  <div style={{ background:"white", borderRadius:20, border:"1px solid #FDE8C8", padding:"18px", marginBottom:16, boxShadow:"0 2px 12px rgba(180,120,40,.07)", ...s }}>{children}</div>
+);
+
+/* ── Global CSS ── */
+const CSS = `
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Baloo 2', sans-serif; -webkit-font-smoothing: antialiased; touch-action: manipulation; }
+  button { font-family: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  input, textarea { font-family: inherit; outline: none; }
+  input::placeholder, textarea::placeholder { color: #CBD5E1; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: #E2E8F0; border-radius: 2px; }
+  .tile { transition: transform .22s cubic-bezier(.34,1.56,.64,1), box-shadow .22s; cursor: pointer; user-select: none; }
+  .tile:active { transform: scale(.95); }
+  .pressable { transition: transform .15s cubic-bezier(.34,1.56,.64,1); cursor: pointer; }
+  .pressable:active { transform: scale(.94); }
+  .iBtn { background: none; border: none; padding: 6px 8px; border-radius: 8px; transition: background .15s; cursor: pointer; font-size: 14px; }
+  .iBtn:active { background: rgba(0,0,0,.07); }
+  .iBtn:disabled { opacity: .35; cursor: default; }
+  @keyframes fadeIn  { from { opacity: 0 } to { opacity: 1 } }
+  @keyframes popIn   { from { opacity: 0; transform: scale(.88) } to { opacity: 1; transform: scale(1) } }
+  @keyframes blink   { 0%,100% { opacity: .3 } 50% { opacity: 1 } }
+  @keyframes shake   { 0%,100% { transform: translateX(0) } 25% { transform: translateX(-9px) } 75% { transform: translateX(9px) } }
+  @keyframes floatY  { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-8px) } }
+  .anim-fade { animation: fadeIn .2s ease both; }
+  .anim-pop  { animation: popIn .28s cubic-bezier(.34,1.56,.64,1) both; }
+  .blink     { animation: blink 1.2s infinite; }
+  .shake     { animation: shake .4s; }
+  .float     { animation: floatY 3s ease-in-out infinite; }
+  .illusWrap svg { width: 100% !important; height: 100% !important; display: block; }
+  @keyframes cloudDrift1 { 0%{transform:translateX(0)}   100%{transform:translateX(18px)}  }
+  @keyframes cloudDrift2 { 0%{transform:translateX(0)}   100%{transform:translateX(-14px)} }
+  @keyframes cloudDrift3 { 0%{transform:translateX(0)}   100%{transform:translateX(22px)}  }
+  @keyframes unicornBob  { 0%,100%{transform:translateY(0) rotate(-2deg)} 50%{transform:translateY(-10px) rotate(2deg)} }
+  @keyframes rainbowPulse{ 0%,100%{opacity:.13} 50%{opacity:.20} }
+  .cloud1 { animation: cloudDrift1 7s ease-in-out infinite alternate; }
+  .cloud2 { animation: cloudDrift2 9s ease-in-out infinite alternate; }
+  .cloud3 { animation: cloudDrift3 6s ease-in-out infinite alternate; }
+  .unicorn-bg { animation: unicornBob 5s ease-in-out infinite; }
+  .rainbow-bg { animation: rainbowPulse 6s ease-in-out infinite; }
+  .illusWrap img { width: 100% !important; height: 100% !important; object-fit: cover; display: block; }
+  @keyframes kb1 { 0%{transform:scale(1)    translate(0%,0%)}   100%{transform:scale(1.18) translate(-3%,-2%)} }
+  @keyframes kb2 { 0%{transform:scale(1.15) translate(-2%,-1%)} 100%{transform:scale(1)    translate(2%,1%)}   }
+  @keyframes kb3 { 0%{transform:scale(1)    translate(1%,-1%)}  100%{transform:scale(1.15) translate(-2%,2%)}  }
+  @keyframes kb4 { 0%{transform:scale(1.12) translate(2%,1%)}   100%{transform:scale(1)    translate(-1%,-2%)} }
+  .kb1 { animation: kb1 14s ease-in-out infinite alternate; transform-origin: center center; }
+  .kb2 { animation: kb2 16s ease-in-out infinite alternate; transform-origin: 60% 40%; }
+  .kb3 { animation: kb3 13s ease-in-out infinite alternate; transform-origin: 40% 60%; }
+  .kb4 { animation: kb4 17s ease-in-out infinite alternate; transform-origin: 55% 55%; }
+  .pin-key {
+    width: 72px; height: 72px; border-radius: 18px; border: none;
+    background: rgba(255,255,255,.1); color: white;
+    font-size: 1.6rem; font-weight: 800; font-family: 'Nunito', sans-serif;
+    transition: background .15s, transform .1s; -webkit-tap-highlight-color: transparent;
+  }
+  .pin-key:active { transform: scale(.92); background: rgba(255,255,255,.3); }
+  .pin-key.del { font-size: 1.2rem; background: rgba(255,255,255,.06); }
+  @keyframes blinkFast { 0%,100%{ opacity:.4 } 50%{ opacity:1 } }
+  .blink-fast { animation: blinkFast .4s infinite; }
+  @keyframes slideUp { from{ opacity:0; transform:translateY(20px) } to{ opacity:1; transform:translateY(0) } }
+  .anim-slide { animation: slideUp .3s cubic-bezier(.34,1.56,.64,1) both; }
+  @keyframes starTwinkle { 0%,100%{ opacity:.15; transform:scale(1) } 50%{ opacity:.85; transform:scale(1.4) } }
+  @keyframes petalFall { 0%{ transform:translateY(-20px) rotate(0deg); opacity:0 } 10%{ opacity:.75 } 90%{ opacity:.4 } 100%{ transform:translateY(105vh) rotate(680deg); opacity:0 } }
+  @keyframes waveSway { 0%,100%{ transform:translateX(0) } 50%{ transform:translateX(-18px) } }
+  @keyframes leafSway { 0%,100%{ transform:rotate(-3deg) } 50%{ transform:rotate(3deg) } }
+  .tile { transition: transform .2s cubic-bezier(.34,1.56,.64,1), box-shadow .2s; cursor:pointer; user-select:none; }
+  .tile:active { transform: scale(.95); }
+  .wp-pill { transition: transform .18s cubic-bezier(.34,1.56,.64,1), box-shadow .18s; cursor:pointer; }
+  .wp-pill.active { transform: scale(1.1); }
+  .wp-pill:active { transform: scale(.92); }
+`;
+
+/* ══════════════════════════════════════════════════════════
+   APP
+══════════════════════════════════════════════════════════ */
+function App() {
+  const [view, setView]         = useState("main");
+  const [stories, setStories]   = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [appPin, setAppPin]     = useState(PIN_DEFAULT);
+  const [apiKey, setApiKey]         = useState("");
+  const [aiProvider, setAiProvider] = useState("anthropic");
+  const [wpId, setWpId]             = useState("szivarvany");
+  const [showWpPicker, setShowWpPicker] = useState(false);
+  const [showApiSetup, setShowApiSetup] = useState(false);
+  const [apiKeyInput, setApiKeyInput]   = useState("");
+  const svgCacheRef = useRef({});
+
+  /* pin */
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState(false);
+  const [pinMode, setPinMode]   = useState("enter");
+  const [pinNewBuf, setPinNewBuf] = useState("");
+
+  /* player */
+  const [pStory, setPStory]     = useState(null);
+  const pStoryRef = useRef(null);
+  const [pLoading, setPLoading] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [audioDur, setAudioDur] = useState(0);
+  const [curTime, setCurTime]   = useState(0);
+  const [illus, setIllus]             = useState(null);
+  const [illusOp, setIllusOp]         = useState(0);
+  const [illusPrev, setIllusPrev]     = useState(null);
+  const [illusPrevOp, setIllusPrevOp] = useState(0);
+  const [genIllus, setGenIllus]       = useState(false);
+  const [illusError, setIllusError]   = useState(null);
+  const [kbClass, setKbClass]         = useState("kb1");
+  const kbIdxRef = useRef(0);
+  const [activeSc, setActiveSc] = useState(-1);
+  const sceneImgsRef = useRef([]);
+  const lastScRef = useRef(-1);
+  const genRef    = useRef(false);
+  const illusRef  = useRef(null); // tracks current illus for crossfade (avoids stale closure)
+  const audioRef  = useRef(null);
+  const pUrlRef   = useRef(null);
+
+  /* editor */
+  const [edId, setEdId]       = useState(null);
+  const [edTitle, setEdTitle] = useState("");
+  const [edNar, setEdNar]     = useState("dad");
+  const [edEmoji, setEdEmoji] = useState("⭐");
+  const [edPal, setEdPal]     = useState(0);
+  const [edSegs, setEdSegs]   = useState([]);
+  const [edScenes, setEdScenes] = useState([{ time:"0:00", desc:"" }]);
+  const [edSaving, setEdSaving] = useState(false);
+
+  /* recording */
+  const [isRec, setIsRec]         = useState(false);
+  const [recDown, setRecDown]     = useState(SEG_MAX);
+  const [recReplIdx, setRecReplIdx] = useState(null);
+  const [prevSegIdx, setPrevSegIdx] = useState(null);
+  const mrRef          = useRef(null);
+  const streamRef      = useRef(null);
+  const countdownRef   = useRef(null);
+  const prevAudioRef   = useRef(null);
+
+  /* import */
+  const importInputRef = useRef(null);
+  const [importing, setImporting] = useState(false);
+
+  /* ── init ── */
+  useEffect(() => {
+    (async () => {
+      try { const p = await storage.get("app-pin");  if (p) setAppPin(p.value); } catch {}
+      try { const m = await storage.get("stories-meta"); if (m) setStories(JSON.parse(m.value)); } catch {}
+      try { const c = await storage.get("svg-cache"); if (c) { svgCacheRef.current = JSON.parse(c.value); } } catch {}
+      try { const k = await storage.get("api-key");  if (k) setApiKey(k.value); } catch {}
+      try { const p = await storage.get("ai-provider"); if (p) setAiProvider(p.value); } catch {}
+      try { const w = await storage.get("wallpaper"); if (w) setWpId(w.value); } catch {}
+      setLoading(false);
+    })();
+  }, []);
+
+  /* ── audio events ── */
+  useEffect(() => {
+    const a = audioRef.current; if (!a) return;
+    const onT = () => { setCurTime(a.currentTime); setProgress(a.duration ? (a.currentTime/a.duration)*100 : 0); checkScene(a.currentTime); };
+    const onL = () => setAudioDur(a.duration);
+    const onE = () => { setIsPlaying(false); setProgress(0); setCurTime(0); a.currentTime = 0; };
+    a.addEventListener("timeupdate", onT);
+    a.addEventListener("loadedmetadata", onL);
+    a.addEventListener("ended", onE);
+    return () => { a.removeEventListener("timeupdate",onT); a.removeEventListener("loadedmetadata",onL); a.removeEventListener("ended",onE); };
+  }, []);
+
+
+
+  // apiKeyRef ensures the audio timeupdate listener (registered once, [] deps)
+  // always reads the current API key rather than a stale closure value.
+  const apiKeyRef = useRef("");
+  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+  const aiProviderRef = useRef("anthropic");
+  useEffect(() => { aiProviderRef.current = aiProvider; }, [aiProvider]);
+
+  // Keep illusRef in sync so fadeInSVG always reads the latest value,
+  // even when called from the memoized checkScene (which has [] deps).
+  useEffect(() => { illusRef.current = illus; }, [illus]);
+
+  // Crossfade: old image fades out while new one fades in simultaneously
+  const fadeInSVG = (svg) => {
+    kbIdxRef.current = (kbIdxRef.current + 1) % 4;
+    setKbClass(["kb1","kb2","kb3","kb4"][kbIdxRef.current]);
+    setIllusPrev(illusRef.current);
+    setIllusPrevOp(1);
+    setIllus(svg);
+    setIllusOp(0);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      setIllusOp(1);
+      setIllusPrevOp(0);
+    }));
+  };
+  // Ref so the memoized checkScene always calls the latest fadeInSVG
+  const fadeInSVGRef = useRef(fadeInSVG);
+  useEffect(() => { fadeInSVGRef.current = fadeInSVG; });
+
+  const checkScene = useCallback(async (time) => {
+    const story = pStoryRef.current;
+    if (!story?.scenes?.length) return;
+    const sorted = [...story.scenes].sort((a,b) => parseSec(a.time)-parseSec(b.time));
+    let ai = -1;
+    for (let i = 0; i < sorted.length; i++) if (time >= parseSec(sorted[i].time)) ai = i;
+    setActiveSc(ai);
+    if (ai === lastScRef.current) return;
+    lastScRef.current = ai;
+    if (ai === -1) return;
+    const key = `${story.id}-${ai}`;
+    // Check for uploaded image (stored separately, keyed by original scene index)
+    const uploadedImg = sceneImgsRef.current[sorted[ai].imgIdx ?? ai];
+    if (uploadedImg) {
+      fadeInSVGRef.current(`<img src="${uploadedImg}" style="width:100%;height:100%;object-fit:cover;display:block;"/>`);
+      return;
+    }
+    if (svgCacheRef.current[key]) { fadeInSVGRef.current(svgCacheRef.current[key]); return; }
+    if (genRef.current) return;
+    genRef.current = true; setGenIllus(true); setIllusError(null);
+    try {
+      const result = await genSVG(sorted[ai].desc, story.title, apiKeyRef.current, aiProviderRef.current);
+      if (result.error) {
+        lastScRef.current = -1;
+        setIllusError(result.error);
+      } else if (result.svg) {
+        // Store in cache regardless of current scene position
+        svgCacheRef.current = { ...svgCacheRef.current, [key]: result.svg };
+        try { await storage.set("svg-cache", JSON.stringify(svgCacheRef.current)); } catch {}
+        fadeInSVGRef.current(result.svg);
+      }
+    } catch (e) { lastScRef.current = -1; setIllusError(`Unexpected error: ${e.message}`); }
+    genRef.current = false; setGenIllus(false);
+  }, []);
+
+  /* ── PIN ── */
+  const openAdmin = () => { setPinInput(""); setPinError(false); setPinMode("enter"); setView("pin"); };
+  const handlePinKey = (k) => {
+    if (k === "⌫") { setPinInput(p => p.slice(0,-1)); setPinError(false); return; }
+    const next = pinInput + k;
+    setPinInput(next);
+    if (next.length < 4) return;
+    const err = () => { setPinError(true); setTimeout(() => { setPinInput(""); setPinError(false); }, 700); };
+    if (pinMode === "enter") {
+      if (next === appPin) { setPinInput(""); setView("admin"); }
+      else err();
+    } else if (pinMode === "change0") {
+      if (next === appPin) { setPinMode("change1"); setPinInput(""); } else err();
+    } else if (pinMode === "change1") {
+      setPinNewBuf(next); setPinMode("change2"); setPinInput("");
+    } else if (pinMode === "change2") {
+      if (next === pinNewBuf) {
+        setAppPin(next); storage.set("app-pin", next).catch(()=>{});
+        setPinInput(""); setPinMode("enter"); setView("admin");
+      } else { err(); setTimeout(() => setPinMode("change1"), 800); }
+    }
+  };
+
+  /* ── Player ── */
+  const openPlayer = async (story) => {
+    setPStory(story); pStoryRef.current = story;
+    setPLoading(true); setIllus(null); setIllusOp(0); setIllusPrev(null); setIllusPrevOp(0); setActiveSc(-1); setIllusError(null);
+    lastScRef.current = -1; genRef.current = false; sceneImgsRef.current = [];
+    setIsPlaying(false); setProgress(0); setCurTime(0); setAudioDur(0);
+    try {
+      const imgData = await storage.get(`scene-imgs:${story.id}`);
+      if (imgData) sceneImgsRef.current = JSON.parse(imgData.value);
+    } catch {}
+    try {
+      const sd = await storage.get(`segments:${story.id}`);
+      if (sd) {
+        const url = await concatToUrl(JSON.parse(sd.value));
+        if (pUrlRef.current) URL.revokeObjectURL(pUrlRef.current);
+        pUrlRef.current = url;
+        if (audioRef.current && url) { audioRef.current.src = url; audioRef.current.load(); }
+      }
+    } catch (e) { console.error(e); }
+    setPLoading(false);
+  };
+
+  const togglePlay = () => {
+    const a = audioRef.current; if (!a) return;
+    if (isPlaying) { a.pause(); setIsPlaying(false); } else { a.play(); setIsPlaying(true); }
+  };
+
+  const seek = (e) => {
+    const a = audioRef.current; if (!a?.duration) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+    a.currentTime = (x / r.width) * a.duration;
+    lastScRef.current = -1;
+  };
+
+  const closePlayer = () => {
+    const a = audioRef.current; if (a) { a.pause(); a.src = ""; }
+    setPStory(null); pStoryRef.current = null; setIsPlaying(false);
+    setIllus(null); setIllusPrev(null); setIllusPrevOp(0);
+    if (pUrlRef.current) { URL.revokeObjectURL(pUrlRef.current); pUrlRef.current = null; }
+  };
+
+  /* ── Editor ── */
+  const openEditor = async (story = null) => {
+    if (story) {
+      setEdId(story.id); setEdTitle(story.title); setEdNar(story.narrator || "dad");
+      setEdEmoji(story.emoji || "⭐"); setEdPal(story.colorIdx || 0);
+      // Load saved scenes and reattach any uploaded images
+      let scenes = story.scenes?.length ? story.scenes.map(s => ({ ...s, img: null })) : [{ time:"0:00", desc:"", img:null }];
+      try {
+        const imgData = await storage.get(`scene-imgs:${story.id}`);
+        if (imgData) {
+          const imgs = JSON.parse(imgData.value);
+          scenes = scenes.map((sc, i) => ({ ...sc, img: imgs[i] || null }));
+        }
+      } catch {}
+      setEdScenes(scenes);
+      try {
+        const sd = await storage.get(`segments:${story.id}`);
+        if (sd) {
+          const b64s = JSON.parse(sd.value);
+          setEdSegs(await Promise.all(b64s.map(async b64 => ({ b64, dur: await getDur(b64) }))));
+        } else setEdSegs([]);
+      } catch { setEdSegs([]); }
+    } else {
+      setEdId(null); setEdTitle(""); setEdNar("dad"); setEdEmoji("⭐");
+      setEdPal(0); setEdScenes([{ time:"0:00", desc:"", img:null }]); setEdSegs([]);
+    }
+    setView("editor");
+  };
+
+  const saveEditor = async () => {
+    if (!edTitle.trim()) return;
+    setEdSaving(true);
+    const id = edId || `s${Date.now()}`;
+    // A scene is valid if it has a timestamp AND either a description or an uploaded image
+    const validScenes = edScenes
+      .filter(s => s.time && (s.desc.trim() || s.img))
+      .map((s, i) => ({ time: s.time, desc: s.desc, imgIdx: s.img ? i : null }));
+    // Always write scene-imgs so removals are persisted (write nulls if no images)
+    const sceneImgs = edScenes.map(s => s.img || null);
+    await storage.set(`scene-imgs:${id}`, JSON.stringify(sceneImgs));
+    const story = { id, title: edTitle.trim(), narrator: edNar, emoji: edEmoji, colorIdx: edPal, scenes: validScenes };
+    const updated = edId ? stories.map(s => s.id === id ? story : s) : [...stories, story];
+    const meta = updated.map(({ id, title, narrator, emoji, colorIdx, scenes }) => ({ id, title, narrator, emoji, colorIdx, scenes }));
+    try {
+      await storage.set("stories-meta", JSON.stringify(meta));
+      if (edSegs.length) await storage.set(`segments:${id}`, JSON.stringify(edSegs.map(s => s.b64)));
+      setStories(updated); setView("admin");
+    } catch (e) { alert("Hiba:" + e.message); }
+    setEdSaving(false);
+  };
+
+  const deleteStory = async (id, e) => {
+    e.stopPropagation();
+    if (!confirm("删除这个故事？")) return;
+    const updated = stories.filter(s => s.id !== id);
+    await storage.set("stories-meta", JSON.stringify(
+      updated.map(({ id,title,narrator,emoji,colorIdx,scenes }) => ({ id,title,narrator,emoji,colorIdx,scenes }))
+    ));
+    try { await storage.delete(`segments:${id}`); } catch {}
+    try { await storage.delete(`scene-imgs:${id}`); } catch {}
+    setStories(updated);
+  };
+
+  /* ── Export ── */
+  const exportStory = async (story, e) => {
+    e.stopPropagation();
+    try {
+      const segsData = await storage.get(`segments:${story.id}`);
+      const segments = segsData ? JSON.parse(segsData.value) : [];
+      const svgs = {};
+      Object.entries(svgCacheRef.current).forEach(([k, v]) => {
+        if (k.startsWith(`${story.id}-`)) svgs[k] = v;
+      });
+      const imgData = await storage.get(`scene-imgs:${story.id}`);
+      const sceneImgs = imgData ? JSON.parse(imgData.value) : null;
+      const bundle = {
+        _type: "storybook/v1",
+        exportedAt: new Date().toISOString(),
+        meta: { title: story.title, narrator: story.narrator, emoji: story.emoji, colorIdx: story.colorIdx, scenes: story.scenes },
+        segments, svgs, sceneImgs,
+      };
+      const json = JSON.stringify(bundle);
+      const filename = `${story.title.replace(/[^a-z0-9]/gi,"_")}.storybook`;
+      if (window.NativeIO) {
+        // Android WebView: save via native bridge to Downloads folder
+        window._exportDone = (ok, msg) => {
+          delete window._exportDone;
+          if (ok) alert("✅ 已保存到下载文件夹：\n" + msg);
+          else    alert("导出错误：" + msg);
+        };
+        window.NativeIO.saveFile(filename, json);
+      } else {
+        // Browser fallback
+        const blob = new Blob([json], { type: "application/json" });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement("a");
+        a.href = url; a.download = filename; a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      }
+    } catch (err) { alert("导出错误：" + err.message); }
+  };
+
+  /* ── Import ── */
+  const handleImportFile = async (e) => {
+    const file = e.target.files[0]; e.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const bundle = JSON.parse(text);
+      if (bundle._type !== "storybook/v1") throw new Error("Érvénytelen fájl");
+      const id = `s${Date.now()}`;
+      const story = { id, ...bundle.meta };
+      const dup = stories.find(s => s.title === story.title);
+      if (dup && !confirm(`"${story.title}" 已存在。作为副本导入？`)) { setImporting(false); return; }
+      const updated = [...stories, story];
+      await storage.set("stories-meta", JSON.stringify(
+        updated.map(({ id,title,narrator,emoji,colorIdx,scenes }) => ({ id,title,narrator,emoji,colorIdx,scenes }))
+      ));
+      if (bundle.segments?.length) await storage.set(`segments:${id}`, JSON.stringify(bundle.segments));
+      if (bundle.sceneImgs) await storage.set(`scene-imgs:${id}`, JSON.stringify(bundle.sceneImgs));
+      if (bundle.svgs) {
+        const newSvgs = { ...svgCacheRef.current };
+        Object.entries(bundle.svgs).forEach(([k, v]) => {
+          const idx = k.split("-").slice(1).join("-");
+          newSvgs[`${id}-${idx}`] = v;
+        });
+        svgCacheRef.current = newSvgs;
+        try { await storage.set("svg-cache", JSON.stringify(newSvgs)); } catch {}
+      }
+      setStories(updated);
+    } catch (err) { alert("导入错误：" + err.message); }
+    setImporting(false);
+  };
+
+  /* ── Native Android recording bridge ── */
+  useEffect(() => {
+    // Called by Kotlin when a native recording finishes
+    window.nativeSegmentReady = async (replIdx) => {
+      const b64 = window.NativeRecorder ? window.NativeRecorder.getLastSegment() : null;
+      if (!b64) return;
+      const dur = await getDur(b64);
+      const seg = { b64, dur };
+      if (replIdx >= 0) setEdSegs(prev => prev.map((s,i) => i === replIdx ? seg : s));
+      else              setEdSegs(prev => [...prev, seg]);
+      setIsRec(false); setRecReplIdx(null);
+    };
+    return () => { delete window.nativeSegmentReady; };
+  }, []);
+
+  /* ── Recording ── */
+  const startRec = async (replIdx = null) => {
+    // ── Native Android bridge (bypasses WebView getUserMedia restrictions) ──
+    if (window.NativeRecorder) {
+      setIsRec(true); setRecReplIdx(replIdx); setRecDown(SEG_MAX);
+      window.NativeRecorder.start(replIdx !== null ? replIdx : -1);
+      let c = SEG_MAX;
+      countdownRef.current = setInterval(() => {
+        c--; setRecDown(c);
+        if (c <= 0) { clearInterval(countdownRef.current); window.NativeRecorder.stop(); }
+      }, 1000);
+      return;
+    }
+    // ── Web fallback (browser / GitHub Pages) ──
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      const chunks = [];
+      const mr = new MediaRecorder(stream);
+      mrRef.current = mr;
+      mr.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        clearInterval(countdownRef.current);
+        const blob = new Blob(chunks, { type: mr.mimeType });
+        const b64 = await new Promise(res => { const r = new FileReader(); r.onload = ev => res(ev.target.result); r.readAsDataURL(blob); });
+        const dur = await getDur(b64);
+        const seg = { b64, dur };
+        if (replIdx !== null) setEdSegs(prev => prev.map((s,i) => i === replIdx ? seg : s));
+        else setEdSegs(prev => [...prev, seg]);
+        setIsRec(false); setRecReplIdx(null);
+      };
+      mr.start();
+      setIsRec(true); setRecReplIdx(replIdx); setRecDown(SEG_MAX);
+      let c = SEG_MAX;
+      countdownRef.current = setInterval(() => {
+        c--; setRecDown(c);
+        if (c <= 0) { clearInterval(countdownRef.current); mr.stop(); }
+      }, 1000);
+    } catch { alert("无法访问麦克风。"); }
+  };
+
+  const stopRec = () => {
+    clearInterval(countdownRef.current);
+    if (window.NativeRecorder) { window.NativeRecorder.stop(); return; }
+    if (mrRef.current?.state === "recording") mrRef.current.stop();
+  };
+
+  const playSegPreview = (idx) => {
+    if (prevAudioRef.current) { prevAudioRef.current.pause(); prevAudioRef.current = null; }
+    if (prevSegIdx === idx) { setPrevSegIdx(null); return; }
+    const a = new Audio(edSegs[idx].b64);
+    prevAudioRef.current = a; setPrevSegIdx(idx);
+    a.play();
+    a.onended = () => { setPrevSegIdx(null); prevAudioRef.current = null; };
+  };
+
+  const deleteSeg = (idx) => {
+    if (prevSegIdx === idx && prevAudioRef.current) { prevAudioRef.current.pause(); prevAudioRef.current = null; setPrevSegIdx(null); }
+    setEdSegs(prev => prev.filter((_,i) => i !== idx));
+    if (prevSegIdx !== null && prevSegIdx > idx) setPrevSegIdx(p => p - 1);
+  };
+
+  /* ══════════════════════════════════════════════════════════
+     RENDER: MAIN
+  ══════════════════════════════════════════════════════════ */
+  const renderMain = () => {
+    const wp = WALLPAPERS.find(w => w.id === wpId) || WALLPAPERS[2];
+
+    const bgLayer = () => {
+      if (wpId === 'rozsa') return (
+        <svg viewBox="0 0 800 580" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none'}}>
+          {[{x:80,y:30,r:20,d:0},{x:240,y:70,r:16,d:1.5},{x:460,y:15,r:24,d:3},{x:630,y:55,r:18,d:0.8},{x:740,y:90,r:14,d:2.2},{x:160,y:190,r:20,d:4},{x:540,y:160,r:17,d:1},{x:300,y:330,r:19,d:2.8},{x:680,y:380,r:16,d:1.6}].map((p,i) => (
+            <g key={i}>
+              <circle cx={p.x} cy={p.y} r={p.r} fill="#FF8FAB" opacity="0.28" style={{animation:`petalFall ${6+p.d}s ${p.d}s linear infinite`}}/>
+              <circle cx={p.x+p.r*.5} cy={p.y-p.r*.3} r={p.r*.55} fill="#FFB3C6" opacity="0.22" style={{animation:`petalFall ${7+p.d}s ${p.d+.6}s linear infinite`}}/>
+            </g>
+          ))}
+          {[[120,80,48],[420,44,44],[690,85,50]].map(([x,y,rx],i)=>(
+            <g key={i} className={['cloud1','cloud2','cloud3'][i]} style={{opacity:.4}}>
+              <ellipse cx={x} cy={y} rx={rx} ry={rx*.42} fill="rgba(255,255,255,.9)"/>
+              <ellipse cx={x-rx*.42} cy={y+rx*.18} rx={rx*.66} ry={rx*.32} fill="rgba(255,255,255,.9)"/>
+              <ellipse cx={x+rx*.44} cy={y+rx*.16} rx={rx*.6} ry={rx*.3} fill="rgba(255,255,255,.9)"/>
+            </g>
+          ))}
+        </svg>
+      );
+      if (wpId === 'kek') return (
+        <svg viewBox="0 0 800 580" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none'}}>
+          {Array.from({length:55},(_,i)=>({x:(i*173)%800,y:(i*97)%580,r:i%5===0?2.8:i%3===0?1.8:1.1,d:(i*.42)%5})).map((st,i)=>(
+            <circle key={i} cx={st.x} cy={st.y} r={st.r} fill="white" opacity=".6" style={{animation:`starTwinkle ${2+st.d}s ${st.d}s ease-in-out infinite`}}/>
+          ))}
+          <ellipse cx="665" cy="78" rx="52" ry="52" fill="rgba(255,255,255,.06)"/>
+          <ellipse cx="665" cy="78" rx="44" ry="44" fill="rgba(255,255,220,.09)"/>
+          <text x="88" y="490" fontSize="46" opacity=".07">🚀</text>
+          <text x="615" cy="78" y="295" fontSize="36" opacity=".08">🪐</text>
+        </svg>
+      );
+      if (wpId === 'szivarvany') return (
+        <svg viewBox="0 0 800 520" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none',userSelect:'none'}}>
+          <defs>
+            <linearGradient id="rb" x1="0%" y1="0%" x2="100%" y2="100%">
+              {[['0%','#FF6B6B'],['16%','#FF9F43'],['33%','#FECA57'],['50%','#48DBFB'],['66%','#1DD1A1'],['83%','#5F27CD'],['100%','#FF6B9D']].map(([o,c])=>(
+                <stop key={o} offset={o} stopColor={c} stopOpacity="0.22"/>
+              ))}
+            </linearGradient>
+            <linearGradient id="rb2" x1="0%" y1="0%" x2="100%" y2="100%">
+              {[['0%','#FF6B6B'],['16%','#FF9F43'],['33%','#FECA57'],['50%','#48DBFB'],['66%','#1DD1A1'],['83%','#5F27CD'],['100%','#FF6B9D']].map(([o,c])=>(
+                <stop key={o} offset={o} stopColor={c} stopOpacity="0.15"/>
+              ))}
+            </linearGradient>
+          </defs>
+          <g className="rainbow-bg">
+            <path d="M-40,320 Q200,20 440,320" fill="none" stroke="url(#rb)" strokeWidth="38" strokeLinecap="round"/>
+            <path d="M-40,340 Q200,40 440,340" fill="none" stroke="url(#rb2)" strokeWidth="28" strokeLinecap="round"/>
+            <path d="M-40,358 Q200,58 440,358" fill="none" stroke="url(#rb)" strokeWidth="18" strokeLinecap="round"/>
+          </g>
+          <g className="rainbow-bg" style={{animationDelay:'3s'}}>
+            <path d="M420,480 Q640,180 860,480" fill="none" stroke="url(#rb)" strokeWidth="32" strokeLinecap="round"/>
+            <path d="M420,498 Q640,198 860,498" fill="none" stroke="url(#rb2)" strokeWidth="22" strokeLinecap="round"/>
+            <path d="M420,514 Q640,214 860,514" fill="none" stroke="url(#rb)" strokeWidth="13" strokeLinecap="round"/>
+          </g>
+          {[[680,72,68,28],[120,110,56,22],[400,48,50,20],[230,390,62,24]].map(([cx,cy,rx,ry],i)=>(
+            <g key={i} className={['cloud1','cloud2','cloud3','cloud1'][i]} style={{opacity:[.5,.45,.4,.35][i],animationDelay:i===3?'2s':undefined}}>
+              <ellipse cx={cx} cy={cy} rx={rx} ry={ry} fill="white"/>
+              <ellipse cx={cx-rx*.44} cy={cy+ry*.38} rx={rx*.64} ry={ry*.8} fill="white"/>
+              <ellipse cx={cx+rx*.46} cy={cy+ry*.35} rx={rx*.58} ry={ry*.76} fill="white"/>
+            </g>
+          ))}
+          <g className="unicorn-bg" style={{opacity:0.18}}>
+            <ellipse cx="590" cy="410" rx="90" ry="55" fill="#F9A8D4"/>
+            <ellipse cx="620" cy="362" rx="28" ry="38" fill="#F9A8D4" transform="rotate(-18 620 362)"/>
+            <ellipse cx="646" cy="330" rx="30" ry="24" fill="#FBCFE8"/>
+            <polygon points="658,310 663,274 668,310" fill="#FCD34D"/>
+            <polygon points="628,320 622,300 638,312" fill="#F9A8D4"/>
+            <ellipse cx="655" cy="328" rx="5" ry="5" fill="#7C3AED"/>
+            <ellipse cx="657" cy="326" rx="2" ry="2" fill="white"/>
+            <path d="M626,318 Q612,340 618,368 Q608,352 600,374 Q592,358 596,382" fill="none" stroke="#C084FC" strokeWidth="7" strokeLinecap="round"/>
+            <path d="M630,316 Q614,338 620,366 Q610,350 602,372" fill="none" stroke="#FB7185" strokeWidth="5" strokeLinecap="round"/>
+            <rect x="548" y="452" width="18" height="52" rx="9" fill="#FBCFE8"/>
+            <rect x="574" y="456" width="18" height="50" rx="9" fill="#FBCFE8"/>
+            <rect x="612" y="456" width="18" height="50" rx="9" fill="#FBCFE8"/>
+            <rect x="638" y="452" width="18" height="52" rx="9" fill="#FBCFE8"/>
+            <path d="M502,418 Q480,390 492,358 Q470,376 478,344" fill="none" stroke="#C084FC" strokeWidth="9" strokeLinecap="round"/>
+            <path d="M504,424 Q478,394 490,362" fill="none" stroke="#FB7185" strokeWidth="6" strokeLinecap="round"/>
+            <path d="M570,388 Q530,350 498,370 Q526,366 544,390" fill="#E879F9" opacity="0.5"/>
+            <text x="700" y="350" fontSize="18" opacity="0.6">✨</text>
+            <text x="510" y="320" fontSize="14" opacity="0.5">⭐</text>
+            <text x="540" y="450" fontSize="12" opacity="0.4">✨</text>
+          </g>
+        </svg>
+      );
+      if (wpId === 'erdo') return (
+        <svg viewBox="0 0 800 580" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none'}}>
+          {[[100,400,52],[220,420,40],[680,395,58],[760,415,36],[48,432,28]].map(([x,y,w],i)=>(
+            <g key={i} style={{animation:`leafSway ${3+i*.7}s ${i*.4}s ease-in-out infinite`,transformOrigin:`${x+w/2}px ${y+110}px`}}>
+              <rect x={x+w/2-5} y={y} width="10" height="110" rx="5" fill="#4A7C59" opacity=".22"/>
+              <ellipse cx={x+w/2} cy={y-8} rx={w/2} ry={w*.5} fill="#52B788" opacity=".2"/>
+              <ellipse cx={x+w/2} cy={y+14} rx={w/2*1.28} ry={w*.56} fill="#40916C" opacity=".16"/>
+            </g>
+          ))}
+          <text x="355" y="490" fontSize="50" opacity=".08">🦌</text>
+          <text x="75" y="155" fontSize="28" opacity=".1">🍃</text>
+          <text x="620" y="200" fontSize="24" opacity=".1">🌿</text>
+        </svg>
+      );
+      if (wpId === 'tenger') return (
+        <svg viewBox="0 0 800 580" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none'}}>
+          {[390,435,468,500].map((y,i)=>(
+            <g key={i} style={{animation:`waveSway ${3.4+i*.5}s ${i*.6}s ease-in-out infinite`}}>
+              <path d={`M-50,${y} Q100,${y-13+i*2} 200,${y} Q350,${y+13-i*2} 500,${y} Q650,${y-11+i*2} 850,${y}`}
+                fill="none" stroke="#3B82F6" strokeWidth={2.8-i*.32} opacity={.1-i*.011} strokeLinecap="round"/>
+            </g>
+          ))}
+          <text x="75" y="345" fontSize="42" opacity=".08">🐬</text>
+          <text x="615" y="470" fontSize="36" opacity=".09">🌊</text>
+          <text x="345" y="178" fontSize="28" opacity=".09">🐚</text>
+          {[[200,115],[500,75],[700,145]].map(([x,y],i)=>(
+            <g key={i} className={['cloud1','cloud2','cloud3'][i]} style={{opacity:.24}}>
+              <ellipse cx={x} cy={y} rx="52" ry="21" fill="white"/>
+              <ellipse cx={x-21} cy={y+8} rx="35" ry="17" fill="white"/>
+              <ellipse cx={x+23} cy={y+7} rx="31" ry="16" fill="white"/>
+            </g>
+          ))}
+        </svg>
+      );
+      if (wpId === 'ejszaka') return (
+        <svg viewBox="0 0 800 580" xmlns="http://www.w3.org/2000/svg" style={{position:'absolute',inset:0,width:'100%',height:'100%',pointerEvents:'none'}}>
+          {Array.from({length:50},(_,i)=>({x:(i*173)%800,y:(i*97)%580,r:i%7===0?2.8:i%3===0?1.9:1.1,d:(i*.48)%4})).map((st,i)=>(
+            <circle key={i} cx={st.x} cy={st.y} r={st.r} fill="white" opacity=".58" style={{animation:`starTwinkle ${2.4+st.d}s ${st.d}s ease-in-out infinite`}}/>
+          ))}
+          <ellipse cx="675" cy="85" rx="50" ry="50" fill="rgba(255,255,255,.07)"/>
+          <ellipse cx="694" cy="72" rx="43" ry="43" fill="rgba(255,255,220,.09)"/>
+          <text x="115" y="490" fontSize="42" opacity=".09">🦉</text>
+          <text x="555" y="415" fontSize="36" opacity=".09">🌌</text>
+        </svg>
+      );
+      return null;
+    };
+
+    return (
+      <div style={{minHeight:'100vh', background:wp.grad, paddingBottom:108, position:'relative', overflow:'hidden'}}>
+        {bgLayer()}
+
+        {/* ── Header ── */}
+        <div style={{textAlign:'center', padding:'44px 20px 20px', position:'relative', zIndex:1}}>
+          <div className="float" style={{fontSize:56, lineHeight:1, marginBottom:6}}>📖</div>
+          <h1 style={{
+            fontFamily:"'Fredoka One',cursive",
+            fontSize:'clamp(1.9rem,6vw,3rem)',
+            color: wp.titleCol,
+            margin:'8px 0 16px',
+            textShadow: wp.dark ? '0 2px 20px rgba(0,0,0,.5)' : '0 2px 0 rgba(255,255,255,.55), 0 4px 20px rgba(0,0,0,.07)',
+            letterSpacing:'.01em',
+          }}>每天一个故事</h1>
+          <div style={{display:'flex', justifyContent:'center', gap:14}}>
+            {Object.entries(NAR).map(([k,v]) => (
+              <div key={k} style={{
+                display:'flex', alignItems:'center', gap:6,
+                fontSize:'.78rem', fontWeight:700, color: wp.subCol,
+                background: wp.dark ? 'rgba(255,255,255,.1)' : 'rgba(255,255,255,.55)',
+                borderRadius:20, padding:'4px 12px', backdropFilter:'blur(4px)',
+              }}>
+                <div style={{width:8,height:8,borderRadius:'50%',background:v.color,boxShadow:`0 0 6px ${v.color}`}}/>
+                {v.icon} {v.label} 的故事
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── Story grid ── */}
+        <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(155px,1fr))', gap:18, maxWidth:860, margin:'8px auto 0', padding:'0 18px', position:'relative', zIndex:1}}>
+          {loading ? (
+            <div style={{gridColumn:'1/-1', textAlign:'center', color:wp.subCol, padding:50, fontWeight:700, opacity:.8}}>正在加载故事...</div>
+          ) : stories.length === 0 ? (
+            <div style={{gridColumn:'1/-1', textAlign:'center', padding:64}}>
+              <div style={{fontSize:52, marginBottom:10}}>📭</div>
+              <div style={{fontWeight:800, color:wp.titleCol, fontSize:'1.1rem'}}>还没有故事...</div>
+              <div style={{color:wp.subCol, marginTop:6, fontWeight:600, fontSize:'.88rem', opacity:.8}}>请大人来添加故事！⚙️</div>
+            </div>
+          ) : stories.map(s => {
+            const nc = NAR[s.narrator || 'dad'];
+            const pal = PALETTES[s.colorIdx % PALETTES.length];
+            return (
+              <div key={s.id} className="tile" onClick={() => openPlayer(s)} style={{
+                background:`linear-gradient(148deg,#fff 0%,${pal.bg} 100%)`,
+                borderRadius:26, padding:'26px 16px 20px', textAlign:'center',
+                boxShadow:`0 2px 0 ${nc.color}44, 0 7px 0 ${nc.color}1A, 0 14px 32px rgba(0,0,0,.12), inset 0 1px 0 rgba(255,255,255,.9)`,
+                position:'relative', overflow:'hidden',
+              }}>
+                <div style={{position:'absolute',top:0,left:0,right:0,height:4,background:`linear-gradient(90deg,${nc.color},${nc.glow})`,borderRadius:'26px 26px 0 0'}}/>
+                <div style={{fontSize:58, lineHeight:1, marginBottom:12}}>{s.emoji}</div>
+                <div style={{fontFamily:"'Fredoka One',cursive", fontSize:'1.05rem', color:'#1E293B', lineHeight:1.3, marginBottom:8}}>{s.title}</div>
+                <div style={{display:'inline-flex', alignItems:'center', gap:4, background:nc.color, color:'white', borderRadius:20, padding:'3px 10px', fontSize:'.65rem', fontWeight:700}}>
+                  {nc.icon} {nc.label}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* ── Bottom bar ── */}
+        <div style={{position:'fixed', bottom:0, left:0, right:0, zIndex:20}}>
+          {showWpPicker && (
+            <div className="anim-slide" style={{
+              background:'rgba(12,8,28,.9)', backdropFilter:'blur(20px)',
+              padding:'16px 18px 12px', borderTop:'1px solid rgba(255,255,255,.1)',
+            }}>
+              <div style={{fontSize:'.6rem', color:'rgba(255,255,255,.45)', fontWeight:800, letterSpacing:'.12em', marginBottom:10, textAlign:'center'}}>背景</div>
+              <div style={{display:'flex', justifyContent:'center', gap:10, flexWrap:'wrap'}}>
+                {WALLPAPERS.map(w => (
+                  <div key={w.id}
+                    className={'wp-pill' + (wpId === w.id ? ' active' : '')}
+                    onClick={() => { setWpId(w.id); setShowWpPicker(false); storage.set('wallpaper', w.id).catch(()=>{}); }}
+                    style={{
+                      width:54, height:54, borderRadius:16,
+                      background:w.grad, cursor:'pointer',
+                      border: wpId===w.id ? '3px solid white' : '2px solid rgba(255,255,255,.2)',
+                      boxShadow: wpId===w.id ? '0 0 0 2px rgba(255,255,255,.35), 0 4px 16px rgba(0,0,0,.4)' : '0 2px 8px rgba(0,0,0,.3)',
+                      display:'flex', alignItems:'center', justifyContent:'center', fontSize:22,
+                    }}>
+                    {w.label.split(' ')[0]}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{
+            background: wp.dark ? 'rgba(12,8,28,.75)' : 'rgba(255,255,255,.6)',
+            backdropFilter:'blur(16px)',
+            borderTop:`1px solid ${wp.dark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)'}`,
+            padding:'10px 22px', display:'flex', justifyContent:'space-between', alignItems:'center',
+          }}>
+            <button onClick={() => setShowWpPicker(v => !v)} style={{
+              background: showWpPicker ? (wp.dark?'rgba(255,255,255,.15)':'rgba(0,0,0,.1)') : 'transparent',
+              border:'none', borderRadius:12, padding:'8px 14px',
+              color: wp.dark ? 'rgba(255,255,255,.75)' : wp.subCol,
+              fontSize:'.78rem', fontWeight:700,
+              display:'flex', alignItems:'center', gap:6,
+            }}>
+              <span style={{fontSize:18}}>{WALLPAPERS.find(w=>w.id===wpId)?.label.split(' ')[0] || '🎨'}</span>
+              Wallpaper
+            </button>
+            <button onClick={openAdmin} style={{
+              background: wp.dark ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.85)',
+              border: wp.dark ? '1px solid rgba(255,255,255,.15)' : '1px solid rgba(0,0,0,.06)',
+              borderRadius:14, padding:'9px 18px',
+              boxShadow:'0 2px 12px rgba(0,0,0,.12)',
+              color: wp.dark ? 'white' : wp.titleCol,
+              fontSize:'.82rem', fontWeight:700,
+              display:'flex', alignItems:'center', gap:6,
+            }}>
+              <span style={{fontSize:16}}>⚙️</span> Settings
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  /* ══════════════════════════════════════════════════════════
+     RENDER: PIN
+  ══════════════════════════════════════════════════════════ */
+  const renderPin = () => {
+    const labels = { enter:"输入 PIN", change0:"当前 PIN", change1:"新 PIN", change2:"确认新 PIN" };
+    return (
+      <div className="anim-fade" style={{ position:"fixed", inset:0, background:"linear-gradient(135deg,#1E293B 0%,#0F172A 100%)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:50 }}>
+        <button onClick={() => setView("main")} style={{ position:"absolute", top:18, left:18, background:"rgba(255,255,255,.1)", color:"rgba(255,255,255,.7)", border:"none", borderRadius:10, padding:"8px 16px", fontSize:"0.85rem", fontWeight:700 }}>← 返回</button>
+        <div style={{ fontSize:34, marginBottom:6 }}>🔐</div>
+        <h2 style={{ fontFamily:"'Fredoka One',cursive", color:"white", fontSize:"1.5rem", marginBottom:5 }}>{labels[pinMode]}</h2>
+        {pinMode === "change1" && <div style={{ color:"rgba(255,255,255,.4)", fontSize:"0.75rem", marginBottom:2 }}>选择一个 4 位 PIN</div>}
+        {pinMode === "change2" && <div style={{ color:"rgba(255,255,255,.4)", fontSize:"0.75rem", marginBottom:2 }}>再次输入以确认</div>}
+        <div className={pinError ? "shake" : ""} style={{ display:"flex", gap:13, margin:"14px 0 32px" }}>
+          {[0,1,2,3].map(i => (
+            <div key={i} style={{ width:16, height:16, borderRadius:"50%", background:pinInput.length>i?(pinError?"#F87171":"#60A5FA"):"rgba(255,255,255,.18)", transition:"background .15s" }}/>
+          ))}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,72px)", gap:12 }}>
+          {["1","2","3","4","5","6","7","8","9","","0","⌫"].map((k,i) => (
+            k === "" ? <div key={i}/> : (
+              <button key={i} className={`pin-key${k==="⌫"?" del":""}`} onClick={() => handlePinKey(k)}>{k}</button>
+            )
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  /* ══════════════════════════════════════════════════════════
+     RENDER: ADMIN
+  ══════════════════════════════════════════════════════════ */
+  const renderAdmin = () => (
+    <div style={{ minHeight:"100vh", background:"linear-gradient(160deg,#FEFCE8 0%,#FFF7ED 55%,#FFFBEB 100%)" }}>
+      <div style={{ background:"rgba(255,255,255,.88)", backdropFilter:"blur(16px)", borderBottom:"1px solid rgba(251,191,36,.2)", padding:"14px 20px", display:"flex", alignItems:"center", justifyContent:"space-between", position:"sticky", top:0, zIndex:10, boxShadow:"0 2px 16px rgba(180,120,40,.07)" }}>
+        <button onClick={() => setView("main")} style={{ background:"none", border:"none", color:"#92400E", fontWeight:800, fontSize:"0.9rem" }}>← 返回</button>
+        <span style={{ fontFamily:"'Fredoka One',cursive", fontSize:"1.3rem", color:"#78350F" }}>设置</span>
+        <button onClick={() => { setPinMode("change0"); setPinInput(""); setPinError(false); setView("pin"); }} style={{ background:"none", border:"none", color:"#D97706", fontSize:"0.76rem", fontWeight:700 }}>更改 PIN</button>
+      </div>
+
+      <input ref={importInputRef} type="file" accept=".storybook,application/json" onChange={handleImportFile} style={{ display:"none" }}/>
+
+      <div style={{ maxWidth:580, margin:"0 auto", padding:"20px 14px" }}>
+
+        {/* API Key setup */}
+        {/* AI provider + API key */}
+        <div onClick={() => { setApiKeyInput(apiKey); setShowApiSetup(s => !s); }} style={{ background:apiKey?"#F0FDF4":"#FFFBEB", border:`1.5px solid ${apiKey?"#86EFAC":"#FCD34D"}`, borderRadius:12, padding:"10px 14px", marginBottom:16, cursor:"pointer", display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ fontSize:20 }}>{apiKey ? "✅" : "🔑"}</div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:800, fontSize:"0.82rem", color: apiKey?"#166534":"#92400E" }}>
+              {apiKey ? "AI 插图已启用" : "设置 AI 插图"}
+            </div>
+            <div style={{ fontSize:"0.72rem", color:"#94A3B8", marginTop:1 }}>
+              {apiKey
+                ? `${aiProvider === "openai" ? "DALL-E 3 (OpenAI) 🖼️" : aiProvider === "gpt-image-1" ? "GPT Image 1 (OpenAI) ✨" : "Claude SVG (Anthropic) 🎨"} · 点击修改`
+                : "选择 AI 提供商并输入您的 API 密钥"}
+            </div>
+          </div>
+          <div style={{ color:"#94A3B8", fontSize:13 }}>{showApiSetup ? "▲" : "▼"}</div>
+        </div>
+        {showApiSetup && (
+          <div style={{ background:"white", border:"1px solid #E2E8F0", borderRadius:12, padding:"14px", marginBottom:16, marginTop:-10 }}>
+            <div style={{ fontSize:"0.72rem", color:"#64748B", fontWeight:800, letterSpacing:"0.05em", marginBottom:8 }}>AI 提供商</div>
+            <div style={{ display:"flex", gap:8, marginBottom:14 }}>
+              {[
+                { id:"anthropic",  icon:"🎨", label:"Claude SVG",    sub:"Anthropic — 风格化插图" },
+                { id:"openai",     icon:"🖼️", label:"DALL-E 3",       sub:"OpenAI — 绘画风格插图" },
+                { id:"gpt-image-1",icon:"✨", label:"GPT Image 1",   sub:"OpenAI — 最佳画质" },
+              ].map(p => (
+                <div key={p.id} onClick={e => { e.stopPropagation(); setAiProvider(p.id); storage.set("ai-provider",p.id).catch(()=>{}); }}
+                  style={{ flex:1, padding:"10px 6px", borderRadius:10, border:`2px solid ${aiProvider===p.id?"#3B82F6":"#E2E8F0"}`, background:aiProvider===p.id?"#EFF6FF":"#F8FAFC", cursor:"pointer" }}>
+                  <div style={{ fontSize:22, marginBottom:3, textAlign:"center" }}>{p.icon}</div>
+                  <div style={{ fontWeight:800, fontSize:"0.73rem", color:aiProvider===p.id?"#1D4ED8":"#334155", textAlign:"center" }}>{p.label}</div>
+                  <div style={{ fontSize:"0.62rem", color:"#94A3B8", marginTop:3, lineHeight:1.4, textAlign:"center" }}>{p.sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize:"0.72rem", color:"#64748B", fontWeight:800, letterSpacing:"0.05em", marginBottom:6 }}>API 密钥</div>
+            <div style={{ fontSize:"0.72rem", color:"#94A3B8", marginBottom:8, lineHeight:1.5 }}>
+              {aiProvider === "anthropic"
+                ? <span>密钥：<strong>console.anthropic.com</strong> → API 密钥。仅存储在此设备上。</span>
+                : <span>密钥：<strong>platform.openai.com</strong> → API 密钥。仅存储在此设备上。</span>}
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <input value={apiKeyInput} onChange={e => setApiKeyInput(e.target.value)}
+                placeholder={aiProvider === "anthropic" ? "sk-ant-..." : "sk-..."} type="password"
+                style={{ flex:1, padding:"9px 12px", borderRadius:9, border:"2px solid #E2E8F0", fontSize:"0.85rem", color:"#1E293B" }}/>
+              <button onClick={() => { const k=apiKeyInput.trim(); setApiKey(k); storage.set("api-key",k).catch(()=>{}); setShowApiSetup(false); }}
+                style={{ background:"#3B82F6", color:"white", border:"none", borderRadius:9, padding:"9px 16px", fontWeight:800, fontSize:"0.82rem" }}>保存</button>
+            </div>
+            {apiKey && <button onClick={() => { setApiKey(""); storage.delete("api-key").catch(()=>{}); setShowApiSetup(false); }}
+              style={{ marginTop:8, background:"none", border:"none", color:"#EF4444", fontSize:"0.75rem", fontWeight:700, cursor:"pointer" }}>删除密钥</button>}
+          </div>
+        )}
+
+        {/* Action row */}
+        <div style={{ display:"flex", gap:10, marginBottom:22 }}>
+          <button onClick={() => openEditor(null)} className="pressable" style={{ flex:1, padding:"15px", borderRadius:16, background:"linear-gradient(135deg,#FEF9C3,#FDE68A)", border:"1.5px solid #FCD34D", color:"#78350F", fontFamily:"'Fredoka One',cursive", fontSize:"1rem", display:"flex", alignItems:"center", justifyContent:"center", gap:7, boxShadow:"0 3px 14px rgba(251,191,36,.2)" }}>✨ 新故事</button>
+          <button onClick={() => importInputRef.current?.click()} disabled={importing} className="pressable" style={{ flex:1, padding:"15px", borderRadius:16, background:"linear-gradient(135deg,#ECFDF5,#D1FAE5)", border:"1.5px solid #6EE7B7", color:"#064E3B", fontFamily:"'Fredoka One',cursive", fontSize:"1rem", display:"flex", alignItems:"center", justifyContent:"center", gap:7, boxShadow:"0 3px 14px rgba(52,211,153,.15)", opacity:importing?0.6:1 }}>{importing?"⏳ 加载中...":"📥 导入故事"}</button>
+        </div>
+
+        {/* Story list */}
+        {stories.length === 0 ? (
+          <div style={{ textAlign:"center", color:"#CBD5E1", padding:40, fontWeight:700 }}>还没有故事 — 创建第一个吧！</div>
+        ) : stories.map(s => {
+          const nc = NAR[s.narrator || "dad"];
+          return (
+            <div key={s.id} style={{ background:"white", borderRadius:18, borderLeft:`5px solid ${nc.color}`, padding:"13px 15px", marginBottom:10, display:"flex", alignItems:"center", gap:12, boxShadow:"0 2px 12px rgba(180,120,40,.06)" }}>
+              <div style={{ fontSize:28 }}>{s.emoji}</div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:800, color:"#1E293B", fontSize:"0.95rem", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.title}</div>
+                <div style={{ fontSize:"0.73rem", color:nc.color, fontWeight:700, marginTop:2 }}>{nc.icon} {nc.label} · {s.scenes?.length||0} 个场景{s.scenes?.length!==1?"":""}</div>
+              </div>
+              <button onClick={() => openEditor(s)} style={{ background:"#EFF6FF", color:"#3B82F6", border:"none", borderRadius:8, padding:"6px 10px", fontWeight:800, fontSize:"0.73rem", flexShrink:0 }}>编辑</button>
+              <button onClick={(e) => exportStory(s,e)} style={{ background:"#F0FDF4", color:"#10B981", border:"none", borderRadius:8, padding:"6px 10px", fontWeight:800, fontSize:"0.73rem", flexShrink:0 }}>导出</button>
+              <button onClick={(e) => deleteStory(s.id,e)} style={{ background:"#FEF2F2", color:"#EF4444", border:"none", borderRadius:8, padding:"6px 8px", fontWeight:800, fontSize:"0.73rem", flexShrink:0 }}>✕</button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  /* ══════════════════════════════════════════════════════════
+     RENDER: EDITOR
+  ══════════════════════════════════════════════════════════ */
+  const renderEditor = () => {
+    const totalDur = edSegs.reduce((a,s) => a+s.dur, 0);
+    return (
+      <div style={{ minHeight:"100vh", background:"linear-gradient(160deg,#FEFCE8 0%,#FFF7ED 55%,#FFFBEB 100%)" }}>
+        <div style={{ background:"rgba(255,255,255,.9)", backdropFilter:"blur(16px)", borderBottom:"1px solid rgba(251,191,36,.2)", padding:"14px 20px", display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:10, boxShadow:"0 2px 16px rgba(180,120,40,.06)" }}>
+          <button onClick={() => setView("admin")} style={{ background:"none", border:"none", color:"#92400E", fontWeight:800, fontSize:"0.9rem" }}>← 返回</button>
+          <span style={{ fontFamily:"'Fredoka One',cursive", fontSize:"1.2rem", color:"#1E293B", flex:1 }}>{edId?"编辑":"新故事"}</span>
+          <button onClick={saveEditor} disabled={!edTitle.trim()||edSaving} className="pressable" style={{ background:edTitle.trim()?"#3B82F6":"#E2E8F0", color:edTitle.trim()?"white":"#94A3B8", border:"none", borderRadius:10, padding:"9px 18px", fontWeight:800, fontSize:"0.88rem" }}>{edSaving?"保存中...":"已保存 ✓"}</button>
+        </div>
+
+        <div style={{ maxWidth:580, margin:"0 auto", padding:"20px 14px 80px" }}>
+
+          <LBL>朗读者</LBL>
+          <div style={{ display:"flex", gap:10, marginBottom:20 }}>
+            {Object.entries(NAR).map(([k,v]) => (
+              <button key={k} onClick={() => setEdNar(k)} style={{ flex:1, padding:"14px 12px", borderRadius:14, border:`3px solid ${edNar===k?v.color:"#E2E8F0"}`, background:edNar===k?`${v.color}12`:"white", color:edNar===k?v.color:"#94A3B8", fontWeight:800, fontSize:"1rem", transition:"all .15s" }}>{v.icon} {v.label}</button>
+            ))}
+          </div>
+
+          <CARD>
+            <LBL>标题</LBL>
+            <input value={edTitle} onChange={e => setEdTitle(e.target.value)} placeholder="例如：白雪公主..." style={{ display:"block", width:"100%", padding:"11px 13px", borderRadius:10, border:"2px solid #E2E8F0", color:"#1E293B", fontSize:"1rem", fontWeight:700 }}/>
+          </CARD>
+
+          <CARD>
+            <LBL>表情</LBL>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:18 }}>
+              {EMOJIS.map(e => (
+                <span key={e} onClick={() => setEdEmoji(e)} style={{ fontSize:22, padding:"5px 6px", borderRadius:8, cursor:"pointer", background:edEmoji===e?"#EFF6FF":"transparent", outline:edEmoji===e?"2px solid #3B82F6":"none", transition:"background .1s" }}>{e}</span>
+              ))}
+            </div>
+
+          </CARD>
+
+          <CARD>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:4 }}>
+              <div style={{ fontFamily:"'Fredoka One',cursive", color:"#1E293B", fontSize:"1.05rem" }}>🎙️ 录音</div>
+              {totalDur > 0 && <div style={{ fontSize:"0.72rem", color:"#94A3B8", fontWeight:700, background:"#F8FAFC", borderRadius:20, padding:"3px 9px" }}>{fmt(totalDur)} · {edSegs.length} seg{edSegs.length!==1?"s":""}</div>}
+            </div>
+            <div style={{ fontSize:"0.76rem", color:"#94A3B8", marginBottom:14, lineHeight:1.5 }}>
+              以<strong style={{color:"#64748B"}}>30 秒为一段</strong>录音。录错了？直接删除那段即可。
+            </div>
+
+            {edSegs.length > 0 && (
+              <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
+                {edSegs.map((seg,i) => {
+                  const replacing = isRec && recReplIdx === i;
+                  const active = prevSegIdx === i;
+                  return (
+                    <div key={i} style={{ background:replacing?"#FEF2F2":active?"#EFF6FF":"#F8FAFC", border:`2px solid ${replacing?"#FCA5A5":active?"#93C5FD":"#E2E8F0"}`, borderRadius:12, padding:"9px 10px", display:"flex", flexDirection:"column", alignItems:"center", gap:3, minWidth:72 }}>
+                      <div style={{ fontSize:"0.62rem", color:"#94A3B8", fontWeight:800 }}>#{i+1}</div>
+                      <div style={{ fontSize:"0.88rem", fontWeight:800, color:"#334155" }}>{fmt(seg.dur)}</div>
+                      <div style={{ display:"flex", gap:1, marginTop:1 }}>
+                        <button onClick={() => playSegPreview(i)} className="iBtn" style={{ color:"#3B82F6" }}>{active?"⏹":"▶"}</button>
+                        <button onClick={() => !isRec && startRec(i)} className="iBtn" disabled={isRec} style={{ color:"#F59E0B" }}>🔄</button>
+                        <button onClick={() => !isRec && deleteSeg(i)} className="iBtn" disabled={isRec} style={{ color:"#EF4444" }}>✕</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {isRec ? (
+              <div className={recDown <= 5 ? "blink-fast" : ""} style={{ display:"flex", alignItems:"center", gap:12, background:recDown<=5?"#FEE2E2":"#FFF5F5", border:`1.5px solid ${recDown<=5?"#EF4444":"#FCA5A5"}`, borderRadius:12, padding:"13px 14px" }}>
+                <div className="blink" style={{ width:11, height:11, borderRadius:"50%", background:"#EF4444", flexShrink:0 }}/>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontWeight:800, color:"#DC2626", fontSize:"0.88rem" }}>
+                    {recReplIdx !== null ? `重新录制... #${recReplIdx+1}` : `录音... #${edSegs.length+1}`}
+                  </div>
+                  <div style={{ height:5, background:"#FECACA", borderRadius:3, marginTop:7 }}>
+                    <div style={{ height:"100%", width:`${((SEG_MAX-recDown)/SEG_MAX)*100}%`, background:"#EF4444", borderRadius:3, transition:"width 1s linear" }}/>
+                  </div>
+                  <div style={{ fontSize:"0.72rem", color:"#94A3B8", marginTop:4, fontWeight:600 }}>剩余 {recDown} 秒</div>
+                </div>
+                <button onClick={stopRec} style={{ background:"#EF4444", color:"white", border:"none", borderRadius:9, padding:"9px 14px", fontWeight:800, fontSize:"0.82rem", flexShrink:0 }}>完成 ✓</button>
+              </div>
+            ) : (
+              <button onClick={() => startRec(null)} className="pressable" style={{ width:"100%", padding:"13px", borderRadius:12, border:"2px dashed #CBD5E1", background:"#F8FAFC", color:"#3B82F6", fontWeight:800, fontSize:"0.92rem", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                🎙️ 录制第 {edSegs.length+1} 段
+              </button>
+            )}
+          </CARD>
+
+          <CARD>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+              <div style={{ fontFamily:"'Fredoka One',cursive", color:"#1E293B", fontSize:"1.05rem" }}>🎨 插图</div>
+              <button onClick={() => setEdScenes(p => [...p,{time:"",desc:"",img:null}])} style={{ background:"#EFF6FF", color:"#3B82F6", border:"none", borderRadius:8, padding:"5px 11px", fontWeight:800, fontSize:"0.75rem" }}>+ 添加</button>
+            </div>
+            <div style={{ fontSize:"0.76rem", color:"#94A3B8", marginBottom:14, lineHeight:1.5 }}>
+              设置时间戳，输入 AI 提示词，或上传您自己的图片。🖼️
+            </div>
+            {edScenes.map((sc,i) => (
+              <div key={i} style={{ background:"#F8FAFC", borderRadius:12, border:"1px solid #E2E8F0", padding:"11px", marginBottom:10 }}>
+                <div style={{ display:"flex", gap:8, alignItems:"flex-start", marginBottom: sc.img ? 8 : 0 }}>
+                  <input value={sc.time} onChange={e => { const s=[...edScenes]; s[i]={...s[i],time:e.target.value}; setEdScenes(s); }} placeholder="0:30"
+                    style={{ width:54, padding:"9px 5px", borderRadius:9, border:"2px solid #E2E8F0", background:"#FFFBEB", color:"#D97706", fontSize:"0.82rem", textAlign:"center", fontWeight:800, flexShrink:0 }}/>
+                  <textarea value={sc.desc} onChange={e => { const s=[...edScenes]; s[i]={...s[i],desc:e.target.value}; setEdScenes(s); }}
+                    placeholder="输入 AI 提示词，或上传您自己的图片。"
+                    rows={2}
+                    style={{ flex:1, padding:"9px 11px", borderRadius:9, border:"2px solid #E2E8F0", background:"white", color:"#334155", fontSize:"0.82rem", resize:"none", lineHeight:1.5 }}/>
+                  {edScenes.length > 1 && (
+                    <button onClick={() => setEdScenes(p => p.filter((_,j) => j!==i))} style={{ background:"none", border:"none", color:"#CBD5E1", fontSize:16, padding:"7px 3px", marginTop:3, flexShrink:0 }}>✕</button>
+                  )}
+                </div>
+                {/* Image upload row */}
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:8 }}>
+                  {sc.img ? (
+                    <>
+                      <img src={sc.img} style={{ width:64, height:44, objectFit:"cover", borderRadius:7, border:"2px solid #3B82F6", flexShrink:0 }}/>
+                      <div style={{ flex:1, fontSize:"0.72rem", color:"#3B82F6", fontWeight:700 }}>自定义图片 — 将显示在故事中。</div>
+                      <button onClick={() => { const s=[...edScenes]; s[i]={...s[i],img:null}; setEdScenes(s); }}
+                        style={{ background:"#FEF2F2", color:"#EF4444", border:"none", borderRadius:7, padding:"4px 9px", fontWeight:800, fontSize:"0.72rem", flexShrink:0 }}>删除</button>
+                    </>
+                  ) : (
+                    <>
+                      <label style={{ flex:1, display:"flex", alignItems:"center", gap:6, background:"white", border:"1.5px dashed #CBD5E1", borderRadius:9, padding:"7px 11px", cursor:"pointer" }}>
+                        <span style={{ fontSize:16 }}>🖼️</span>
+                        <span style={{ fontSize:"0.75rem", color:"#94A3B8", fontWeight:700 }}>上传您自己的图片（可选）</span>
+                        <input type="file" accept="image/*" style={{ display:"none" }} onChange={e => {
+                          const file = e.target.files[0]; e.target.value = "";
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = ev => { const s=[...edScenes]; s[i]={...s[i],img:ev.target.result}; setEdScenes(s); };
+                          reader.readAsDataURL(file);
+                        }}/>
+                      </label>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          </CARD>
+        </div>
+      </div>
+    );
+  };
+
+  /* ══════════════════════════════════════════════════════════
+     RENDER: PLAYER
+  ══════════════════════════════════════════════════════════ */
+  const renderPlayer = () => {
+    if (!pStory) return null;
+    const nc  = NAR[pStory.narrator || "dad"];
+    const pal = PALETTES[pStory.colorIdx % PALETTES.length];
+    const sorted = pStory.scenes?.length ? [...pStory.scenes].sort((a,b) => parseSec(a.time)-parseSec(b.time)) : [];
+    return (
+      <div className="anim-fade" onClick={closePlayer} style={{ position:"fixed", inset:0, background:"rgba(15,23,42,.93)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:16 }}>
+        <div className="anim-pop" onClick={e => e.stopPropagation()} style={{ background:"white", borderRadius:32, overflow:"hidden", maxWidth:440, width:"100%", boxShadow:`0 0 0 3px ${nc.color}28, 0 0 70px ${nc.color}1A, 0 32px 80px rgba(0,0,0,.8)` }}>
+          <div style={{height:5,background:`linear-gradient(90deg,${nc.color},${nc.glow},${nc.color})`}}/>
+
+          <div style={{ width:"100%", height:260, background:`linear-gradient(160deg,${pal.bg},#F1F5F9)`, position:"relative", overflow:"hidden", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            {/* Background layer — previous image fading out */}
+            {illusPrev && (
+              <div dangerouslySetInnerHTML={{ __html: illusPrev }} className="illusWrap"
+                style={{ position:"absolute", inset:0, opacity:illusPrevOp, transition:"opacity 1.4s ease", overflow:"hidden", zIndex:1 }}/>
+            )}
+            {/* Foreground layer — new image fading in */}
+            {illus && (
+              <div dangerouslySetInnerHTML={{ __html: illus }} className={`illusWrap ${kbClass}`}
+                style={{ position:"absolute", inset:0, opacity:illusOp, transition:"opacity 1.4s ease", overflow:"hidden", zIndex:2 }}/>
+            )}
+            {/* Placeholder when no image yet */}
+            {!illus && (
+              <div style={{ textAlign:"center", padding:"0 16px", zIndex:3 }}>
+                {pLoading
+                  ? <div style={{ color:"rgba(255,255,255,.6)", fontWeight:700 }}>正在准备音频...</div>
+                  : illusError
+                    ? <div>
+                        <div style={{ color:"#FCA5A5", fontWeight:700, fontSize:"0.78rem", lineHeight:1.5, marginBottom:10 }}>⚠️ {illusError}</div>
+                        <button onClick={() => { setIllusError(null); checkScene(audioRef.current?.currentTime || 0); }}
+                          style={{ background:"rgba(255,255,255,.15)", color:"white", border:"1px solid rgba(255,255,255,.3)", borderRadius:20, padding:"6px 18px", fontWeight:800, fontSize:"0.8rem", cursor:"pointer" }}>
+                          🔄 重试
+                        </button>
+                      </div>
+                    : genIllus
+                      ? <div className="blink" style={{ color:"rgba(255,255,255,.7)", fontWeight:800, fontSize:"0.9rem" }}>🎨 正在生成插图...</div>
+                      : <div className="float" style={{ fontSize:64 }}>{pStory.emoji}</div>
+                }
+              </div>
+            )}
+            {genIllus && illus && (
+              <div className="blink" style={{ position:"absolute", bottom:8, right:10, background:"rgba(0,0,0,.55)", color:"white", fontSize:"0.68rem", borderRadius:20, padding:"3px 10px", fontWeight:800, zIndex:4 }}>🎨 正在生成下一张…</div>
+            )}
+            <button onClick={closePlayer} style={{ position:"absolute", top:10, right:10, background:"rgba(0,0,0,.4)", color:"white", border:"none", borderRadius:"50%", width:32, height:32, fontSize:15, zIndex:5 }}>✕</button>
+          </div>
+
+          <div style={{ padding:"16px 22px 22px" }}>
+            <div style={{ textAlign:"center", marginBottom:14 }}>
+              <div style={{ fontFamily:"'Fredoka One',cursive", fontSize:"1.55rem", color:"#1E293B", lineHeight:1.2 }}>{pStory.title}</div>
+              <div style={{display:"inline-flex",alignItems:"center",gap:4,marginTop:6,background:nc.color,color:"white",borderRadius:20,padding:"3px 12px",fontSize:".7rem",fontWeight:700}}>{nc.icon} {nc.label}</div>
+            </div>
+
+            <div onClick={seek} onTouchStart={seek} style={{ height:9, background:"#F1F5F9", borderRadius:5, cursor:"pointer", overflow:"hidden", marginBottom:4 }}>
+              <div style={{ height:"100%", width:progress+"%", background:`linear-gradient(90deg,${nc.color},${nc.glow})`, borderRadius:5, transition:"width .1s linear" }}/>
+            </div>
+            {sorted.length > 0 && audioDur > 0 && (
+              <div style={{ position:"relative", height:6, marginBottom:3 }}>
+                {sorted.map((sc,i) => (
+                  <div key={i} title={sc.desc} style={{ position:"absolute", left:`${(parseSec(sc.time)/audioDur)*100}%`, top:0, width:2, height:6, background:`${nc.color}80`, borderRadius:2, transform:"translateX(-50%)" }}/>
+                ))}
+              </div>
+            )}
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:"0.78rem", color:"#64748B", fontWeight:700, marginBottom:10 }}>
+              <span>{fmt(curTime)}</span><span>{fmt(audioDur)}</span>
+            </div>
+            {sorted.length > 0 && (
+              <div style={{ display:"flex", justifyContent:"center", gap:5, marginBottom:14 }}>
+                {sorted.map((_,i) => (
+                  <div key={i} style={{ width:activeSc===i?22:7, height:7, borderRadius:4, background:activeSc===i?nc.color:`${nc.color}3A`, transition:"all .35s ease" }}/>
+                ))}
+              </div>
+            )}
+            <div style={{ display:"flex", justifyContent:"center", gap:14, alignItems:"center" }}>
+              <button onClick={() => { const a=audioRef.current; if(a){a.currentTime=Math.max(0,a.currentTime-10);lastScRef.current=-1;} }} style={{ width:50,height:50,borderRadius:"50%",background:"rgba(0,0,0,.08)",color:"#475569",border:"none",fontSize:20 }}>⏪</button>
+              <button onClick={togglePlay} style={{ width:76,height:76,borderRadius:"50%",background:`linear-gradient(135deg,${nc.color},${nc.glow})`,color:"white",border:"none",fontSize:30,boxShadow:`0 6px 24px ${nc.color}60` }}>{isPlaying?"⏸":"▶"}</button>
+              <button onClick={() => { const a=audioRef.current; if(a){a.currentTime=Math.min(a.duration||0,a.currentTime+10);lastScRef.current=-1;} }} style={{ width:50,height:50,borderRadius:"50%",background:"rgba(0,0,0,.08)",color:"#475569",border:"none",fontSize:20 }}>⏩</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <audio ref={audioRef}/>
+      {view === "main"   && renderMain()}
+      {view === "pin"    && renderPin()}
+      {view === "admin"  && renderAdmin()}
+      {view === "editor" && renderEditor()}
+      {pStory            && renderPlayer()}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
