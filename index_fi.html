@@ -120,7 +120,7 @@ async function genSVG(desc, title, apiKey, provider) {
       if (provider === "nano-banana") {
         // Nano Banana 2 — Google Gemini image generation
         const r = await fetch(
-          "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
           {
             method: "POST",
             headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
@@ -1060,7 +1060,7 @@ function App() {
             </div>
             <div style={{ fontSize:"0.72rem", color:"#94A3B8", marginTop:1 }}>
               {apiKey
-                ? `${aiProvider === "nano-banana" ? "Nano Banana 2 (Google) 🍌" : aiProvider === "gpt-image-1" ? "GPT Image 1 (OpenAI) ✨" : "Claude SVG (Anthropic) 🎨"} · Muuta napauttamalla`
+                ? `${aiProvider === "nano-banana" ? "Nano Banana (Google) 🍌" : aiProvider === "gpt-image-1" ? "GPT Image 1 (OpenAI) ✨" : "Claude SVG (Anthropic) 🎨"} · Muuta napauttamalla`
                 : "Valitse tekoälyntarjoaja ja syötä API-avaimesi"}
             </div>
           </div>
@@ -1072,7 +1072,7 @@ function App() {
             <div style={{ display:"flex", gap:8, marginBottom:14 }}>
               {[
                 { id:"anthropic",  icon:"🎨", label:"Claude SVG",    sub:"Anthropic — tyylitelty piirros" },
-                { id:"nano-banana",icon:"🍌", label:"Nano Banana 2",  sub:"Google — painted illustration" },
+                { id:"nano-banana",icon:"🍌", label:"Nano Banana",  sub:"Google — painted illustration" },
                 { id:"gpt-image-1",icon:"✨", label:"GPT Image 1",   sub:"OpenAI — paras laatu" },
               ].map(p => (
                 <div key={p.id} onClick={e => { e.stopPropagation(); setAiProvider(p.id); storage.set("ai-provider",p.id).catch(()=>{}); }}
